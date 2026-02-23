@@ -1,3 +1,5 @@
+"""Comando CLI para completar keywords por categoría en el manifest."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,14 +8,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
-
 from worklib.prompt_loader import load_prompt
 
-from .manifest_json import safe_json_load, safe_json_dump, backup_file, index_docs_by_category
-from .openai_utils import get_client, llm_json, get_vs_file_text
-
-KEYWORDS_SYSTEM = load_prompt("library_ops_fill_keywords")
+from .manifest_json import safe_json_load, index_docs_by_category, persist_manifest
+from .openai_utils import get_client_from_env, llm_json, get_vs_file_text
 
 def normalize_kw(k: str) -> str:
     k = (k or "").strip().lower()
@@ -39,14 +37,12 @@ def run(
     only_empty: bool = False,
     debug: bool = False,
 ) -> int:
-    load_dotenv()
-    client = get_client()
+    client = get_client_from_env()
+    keywords_system = load_prompt("library_ops_fill_keywords")
 
     if not manifest.exists():
         print(f"❌ No existe: {manifest}")
         return 2
-
-    out_path = out or manifest
 
     data = safe_json_load(manifest)
     cats: Dict[str, Any] = data.get("categories", {}) or {}
@@ -93,7 +89,7 @@ def run(
             "evidence_docs": evidence_docs,
         }
 
-        outj = llm_json(client, model, KEYWORDS_SYSTEM, json.dumps(payload, ensure_ascii=False, indent=2))
+        outj = llm_json(client=client, model=model, system=keywords_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
         kws = outj.get("keywords") or []
         kws = [normalize_kw(k) for k in kws if isinstance(k, str)]
         kws = [k for k in kws if k]
@@ -108,12 +104,11 @@ def run(
             if updated % 10 == 0:
                 print(f"... {updated} categorías actualizadas")
 
-    if out_path == manifest:
-        bk = backup_file(manifest)
-        print(f"🧷 Backup: {bk}")
+    saved_path, backup_path = persist_manifest(manifest, out, data)
+    if backup_path:
+        print(f"🧷 Backup: {backup_path}")
 
-    safe_json_dump(out_path, data)
-    print(f"✅ Guardado: {out_path}")
+    print(f"✅ Guardado: {saved_path}")
     return 0
 
 def build_parser(sp: argparse._SubParsersAction) -> None:

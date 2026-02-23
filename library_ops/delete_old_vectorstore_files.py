@@ -5,10 +5,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
-from dotenv import load_dotenv
-
 from .manifest_json import safe_json_load
-from .openai_utils import get_client
+from .openai_utils import get_client_from_env
 
 def run(
     *,
@@ -19,8 +17,7 @@ def run(
     max_deletes: int = 0,
     skip_vs: str = "",
 ) -> int:
-    load_dotenv()
-    client = get_client()
+    client = get_client_from_env()
 
     if not manifest.exists():
         print(f"❌ No existe: {manifest}")

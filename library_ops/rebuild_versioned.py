@@ -22,6 +22,7 @@ from worklib.store import Category, Doc, Manifest, load_manifest, save_manifest
 from worklib.prompt_loader import load_prompt
 
 from .openai_utils import get_client, llm_json, get_vs_file_text
+from .bootstrap_manifest import run as bootstrap_manifest_run
 
 # -----------------------------
 # Utils (file ops)
@@ -149,20 +150,20 @@ def taxonomy_tree_txt(paths: List[str]) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 # -----------------------------
-# LLM prompts (same as original)
+# LLM prompts (lazy load to keep CLI import-safe)
 # -----------------------------
 
-PREFIX_SYSTEM = load_prompt("library_ops_prefix_system")
+def get_prompts() -> Dict[str, str]:
+    return {
+        "prefix": load_prompt("library_ops_prefix_system"),
+        "taxonomy": load_prompt("library_ops_taxonomy_system"),
+        "propose": load_prompt("library_ops_propose_system"),
+        "validate": load_prompt("library_ops_validate_system"),
+    }
 
-TAXONOMY_SYSTEM = load_prompt("library_ops_taxonomy_system")
-
-PROPOSE_SYSTEM = load_prompt("library_ops_propose_system")
-
-VALIDATE_SYSTEM = load_prompt("library_ops_validate_system") 
-
-def infer_prefixes_batch(client, model_nano: str, docs: List[Doc]) -> Dict[str, Dict[str, Any]]:
+def infer_prefixes_batch(client, model_nano: str, docs: List[Doc], *, prefix_system: str) -> Dict[str, Dict[str, Any]]:
     payload = {"docs": [{"doc_id": d.doc_id, "filename": d.filename, "title": d.title, "author": d.author, "tags": d.tags} for d in docs]}
-    out = llm_json(client, model_nano, PREFIX_SYSTEM, json.dumps(payload, ensure_ascii=False, indent=2))
+    out = llm_json(client=client, model=model_nano, system=prefix_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
     results: Dict[str, Dict[str, Any]] = {}
     for r in (out.get("results") or []):
         did = r.get("doc_id")
@@ -179,16 +180,16 @@ def infer_prefixes_batch(client, model_nano: str, docs: List[Doc]) -> Dict[str, 
         results[did] = {"author_key": ak, "year": y}
     return results
 
-def build_taxonomy(client, model_tax: str, manifest: Manifest) -> Dict[str, Any]:
+def build_taxonomy(client, model_tax: str, manifest: Manifest, *, taxonomy_system: str) -> Dict[str, Any]:
     cats = []
     for c in manifest.categories.values():
         if c.name == "__ingest_tmp__":
             continue
         cats.append({"name": c.name, "keywords": list((c.keywords or [])[:25])})
     payload = {"categories": cats}
-    return llm_json(client, model_tax, TAXONOMY_SYSTEM, json.dumps(payload, ensure_ascii=False, indent=2))
+    return llm_json(client=client, model=model_tax, system=taxonomy_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
 
-def propose_base_path(client, model_nano: str, taxonomy_paths: List[str], doc: Doc, doc_text: str) -> Dict[str, Any]:
+def propose_base_path(client, model_nano: str, taxonomy_paths: List[str], doc: Doc, doc_text: str, *, propose_system: str) -> Dict[str, Any]:
     payload = {
         "doc_id": doc.doc_id,
         "filename": doc.filename,
@@ -199,7 +200,7 @@ def propose_base_path(client, model_nano: str, taxonomy_paths: List[str], doc: D
         "taxonomy_paths": taxonomy_paths[:2000],
         "doc_text_excerpt": doc_text[:6000],
     }
-    out = llm_json(client, model_nano, PROPOSE_SYSTEM, json.dumps(payload, ensure_ascii=False, indent=2))
+    out = llm_json(client=client, model=model_nano, system=propose_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
     out["doc_id"] = doc.doc_id
     p = out.get("proposed_path", "misc")
     p = "/".join([slugify(x) for x in str(p).split("/") if x.strip()]) or "misc"
@@ -209,9 +210,9 @@ def propose_base_path(client, model_nano: str, taxonomy_paths: List[str], doc: D
     out["proposed_path"] = p
     return out
 
-def validate_batch(client, model_mini: str, taxonomy_paths: List[str], batch_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_batch(client, model_mini: str, taxonomy_paths: List[str], batch_items: List[Dict[str, Any]], *, validate_system: str) -> Dict[str, Any]:
     payload = {"taxonomy_paths": taxonomy_paths[:2000], "batch": batch_items}
-    return llm_json(client, model_mini, VALIDATE_SYSTEM, json.dumps(payload, ensure_ascii=False, indent=2))
+    return llm_json(client=client, model=model_mini, system=validate_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
 
 def run(
     *,
@@ -231,13 +232,18 @@ def run(
 
     manifest_path = manifest_override if manifest_override else cfg.manifest_path
     if not manifest_path.exists():
-        print(f"❌ No existe manifest: {manifest_path}")
-        return 2
+        print(f"⚠️ No existe manifest: {manifest_path}")
+        print("↪ Intentando reconstruirlo automáticamente desde los documentos existentes...")
+        rc_boot = bootstrap_manifest_run(manifest_out=manifest_path, library_dir=cfg.library_dir, force=False)
+        if rc_boot != 0:
+            print("❌ No fue posible reconstruir el manifest automáticamente.")
+            return rc_boot
 
     manifest = load_manifest(manifest_path)
     docs_all = list(manifest.docs.values())
 
     client = get_client()
+    prompts = get_prompts()
     model_tax, model_nano, model_mini = model_names()
 
     docs = docs_all[: max_docs] if max_docs and max_docs > 0 else docs_all
@@ -254,7 +260,7 @@ def run(
     for i in range(0, len(docs), prefix_batch):
         batch = docs[i:i+prefix_batch]
         try:
-            out = infer_prefixes_batch(client, model_nano, batch)
+            out = infer_prefixes_batch(client, model_nano, batch, prefix_system=prompts["prefix"])
         except Exception:
             out = {}
         for d in batch:
@@ -269,7 +275,7 @@ def run(
 
     # Step 1: taxonomy base
     print(f"🧠 ({model_tax}) Generando taxonomía base para {version_label}...")
-    taxonomy = build_taxonomy(client, model_tax, manifest)
+    taxonomy = build_taxonomy(client, model_tax, manifest, taxonomy_system=prompts["taxonomy"])
     base_paths = [t.get("path") for t in (taxonomy.get("taxonomy") or []) if isinstance(t, dict)]
     base_paths = sorted(set([p.strip("/").strip() for p in base_paths if p]))
     if "misc" not in base_paths:
@@ -298,7 +304,7 @@ def run(
         doc_text = ""
         if vsid and d.openai_file_id:
             doc_text = get_vs_file_text(client, vsid, d.openai_file_id, max_chars=6000)
-        proposals[d.doc_id] = propose_base_path(client, model_nano, base_paths, d, doc_text)
+        proposals[d.doc_id] = propose_base_path(client, model_nano, base_paths, d, doc_text, propose_system=prompts["propose"])
 
     # Step 3: validate loops
     accepted_base: Dict[str, str] = {}
@@ -330,7 +336,7 @@ def run(
         pending_list = list(pending)
         for i in range(0, len(pending_list), batch_size):
             batch_ids = pending_list[i:i+batch_size]
-            result = validate_batch(client, model_mini, base_paths, batch_items(batch_ids))
+            result = validate_batch(client, model_mini, base_paths, batch_items(batch_ids), validate_system=prompts["validate"])
             for r in (result.get("results") or []):
                 did = r.get("doc_id")
                 if not did or did not in pending:
@@ -351,7 +357,7 @@ def run(
                 if vsid and d.openai_file_id:
                     doc_text = get_vs_file_text(client, vsid, d.openai_file_id, max_chars=4500)
                 doc_text = (doc_text + "\n\n[MINI_FEEDBACK]\n" + json.dumps(fb, ensure_ascii=False))[:6000]
-                proposals[did] = propose_base_path(client, model_nano, base_paths, d, doc_text)
+                proposals[did] = propose_base_path(client, model_nano, base_paths, d, doc_text, propose_system=prompts["propose"])
 
     for did in list(pending):
         accepted_base[did] = "misc"
