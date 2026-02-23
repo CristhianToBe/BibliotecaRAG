@@ -1,0 +1,17 @@
+"""
+Wrapper raíz para library_ops.
+
+Permite ejecutar:
+    python run_library_ops.py orchestrate ...
+    python run_library_ops.py rebuild-versioned ...
+    python run_library_ops.py fill-keywords ...
+    python run_library_ops.py fill-vectorstores ...
+    python run_library_ops.py delete-old-vs-files ...
+"""
+
+import sys
+from library_ops.cli import main
+
+
+if __name__ == "__main__":
+    main()

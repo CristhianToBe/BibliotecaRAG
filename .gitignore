@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual env
+.venv/
+venv/
+
+
+# Local state / outputs
+Biblioteca/
+_state/
+**/_state/
+prompts/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
