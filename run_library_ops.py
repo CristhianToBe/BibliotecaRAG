@@ -9,9 +9,8 @@ Permite ejecutar:
     python run_library_ops.py delete-old-vs-files ...
 """
 
-import sys
 from library_ops.cli import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

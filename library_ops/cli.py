@@ -1,3 +1,5 @@
+"""CLI principal de `library_ops` con subcomandos de mantenimiento."""
+
 from __future__ import annotations
 
 import argparse

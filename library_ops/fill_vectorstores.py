@@ -1,13 +1,13 @@
+"""Comando CLI para crear/llenar vector stores por categoría."""
+
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 from typing import Any, Dict, List
 
-from dotenv import load_dotenv
-
-from .manifest_json import safe_json_load, safe_json_dump, backup_file, index_docs_by_category
-from .openai_utils import get_client, create_vector_store, attach_files, upload_file
+from .manifest_json import safe_json_load, index_docs_by_category, persist_manifest
+from .openai_utils import get_client_from_env, create_vector_store, attach_files, upload_file
 
 def run(
     *,
@@ -21,14 +21,11 @@ def run(
     upload_missing: bool = False,
     max_cats: int = 0,
 ) -> int:
-    load_dotenv()
-    client = get_client()
+    client = get_client_from_env()
 
     if not manifest.exists():
         print(f"❌ No existe: {manifest}")
         return 2
-
-    out_path = out or manifest
 
     data = safe_json_load(manifest)
     cats: Dict[str, Any] = data.get("categories", {}) or {}
@@ -115,14 +112,12 @@ def run(
         print(f"- categorías procesadas: {processed}")
         return 0
 
-    if out_path == manifest:
-        bk = backup_file(manifest)
-        print(f"\n🧷 Backup: {bk}")
-
-    safe_json_dump(out_path, data)
+    saved_path, backup_path = persist_manifest(manifest, out, data)
+    if backup_path:
+        print(f"\n🧷 Backup: {backup_path}")
 
     print("\n✅ LISTO ===")
-    print(f"- guardado: {out_path}")
+    print(f"- guardado: {saved_path}")
     print(f"- categorías procesadas: {processed}")
     print(f"- vector stores creados: {created}")
     print(f"- archivos adjuntados: {attached_total}")
