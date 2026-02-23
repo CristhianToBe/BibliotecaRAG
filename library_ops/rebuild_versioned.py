@@ -22,6 +22,7 @@ from worklib.store import Category, Doc, Manifest, load_manifest, save_manifest
 from worklib.prompt_loader import load_prompt
 
 from .openai_utils import get_client, llm_json, get_vs_file_text
+from .bootstrap_manifest import run as bootstrap_manifest_run
 
 # -----------------------------
 # Utils (file ops)
@@ -231,8 +232,12 @@ def run(
 
     manifest_path = manifest_override if manifest_override else cfg.manifest_path
     if not manifest_path.exists():
-        print(f"❌ No existe manifest: {manifest_path}")
-        return 2
+        print(f"⚠️ No existe manifest: {manifest_path}")
+        print("↪ Intentando reconstruirlo automáticamente desde los documentos existentes...")
+        rc_boot = bootstrap_manifest_run(manifest_out=manifest_path, library_dir=cfg.library_dir, force=False)
+        if rc_boot != 0:
+            print("❌ No fue posible reconstruir el manifest automáticamente.")
+            return rc_boot
 
     manifest = load_manifest(manifest_path)
     docs_all = list(manifest.docs.values())

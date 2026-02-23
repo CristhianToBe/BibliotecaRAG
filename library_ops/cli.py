@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 
-from . import rebuild_versioned, fill_vectorstores, fill_keywords, delete_old_vectorstore_files, orchestrate
+from . import bootstrap_manifest, rebuild_versioned, fill_vectorstores, fill_keywords, delete_old_vectorstore_files, orchestrate
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="library_ops", description="BibliotecaRAG ops (refactor)")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
+    bootstrap_manifest.build_parser(sp)
     rebuild_versioned.build_parser(sp)
     fill_vectorstores.build_parser(sp)
     fill_keywords.build_parser(sp)
