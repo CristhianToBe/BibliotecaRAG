@@ -49,7 +49,6 @@ python run_library_ops.py --help
 
 Subcomandos disponibles:
 
-- `bootstrap-manifest`
 - `rebuild-versioned`
 - `fill-vectorstores`
 - `fill-keywords`
@@ -70,16 +69,3 @@ Este repo fue limpiado para reducir duplicación en:
 - bootstrap del cliente OpenAI (`library_ops/openai_utils.py` delega en `worklib.openai_client`),
 - persistencia de manifest (`library_ops/manifest_json.py`),
 - wrappers CLI mínimos y consistentes.
-
-
-## Recuperar `library.json` si fue borrado
-
-Si se borró `Biblioteca/_state/library.json`, puedes reconstruirlo escaneando los documentos de `biblioteca/`:
-
-```bash
-python -m library_ops bootstrap-manifest
-# o con rutas explícitas
-python -m library_ops bootstrap-manifest --library-dir ./Biblioteca/biblioteca --manifest ./Biblioteca/_state/library.json
-```
-
-Además, `rebuild-versioned` intenta reconstruir el manifest automáticamente si no existe.
