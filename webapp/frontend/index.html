@@ -76,6 +76,7 @@
 
     <script>
       const { createApp } = Vue;
+      const API_BASE = '';
 
       createApp({
         data() {
@@ -108,7 +109,7 @@
             this.question = "";
             this.loadingChat = true;
             try {
-              const r = await fetch('/api/chat', {
+              const r = await fetch(`${API_BASE}/api/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ question: q }),
@@ -144,7 +145,7 @@
             form.append('tags', this.tags);
 
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/upload');
+            xhr.open('POST', `${API_BASE}/api/upload`);
 
             xhr.upload.onprogress = (e) => {
               if (e.lengthComputable) {
