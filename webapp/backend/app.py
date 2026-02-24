@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -36,6 +37,14 @@ def _max_upload_bytes() -> int:
 
 def _upload_dir() -> Path:
     return Path(os.getenv("WEBAPP_UPLOAD_DIR", "uploads")).resolve()
+
+
+def _chat_timeout_seconds() -> float:
+    raw = os.getenv("WEBAPP_CHAT_TIMEOUT_SECONDS", "90")
+    try:
+        return max(1.0, float(raw))
+    except Exception:
+        return 90.0
 
 
 class APIError(BaseModel):
@@ -119,54 +128,56 @@ def health() -> dict:
     }
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+@app.post("/api/chat")
+def chat(req: ChatRequest):
     q = req.question.strip()
     if not q:
-        raise HTTPException(status_code=400, detail={"error": "invalid_question", "detail": "question no puede estar vacía"})
+        return JSONResponse(status_code=400, content={"error": "invalid_question", "details": "question no puede estar vacía"})
+
+    timeout_s = _chat_timeout_seconds()
+    started_at = time.perf_counter()
 
     try:
-        started_at = time.perf_counter()
-        result = pro_query_non_interactive(
-            q,
-            manifest_path=req.manifest_path,
-            max_workers=req.max_workers,
-            debug=req.debug,
-            confirm=req.confirm,
-            confirm_rounds=req.confirm_rounds,
-            confirm_glimpse=req.confirm_glimpse,
-        )
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(
+                pro_query_non_interactive,
+                q,
+                manifest_path=req.manifest_path,
+                max_workers=req.max_workers,
+                debug=req.debug,
+                confirm=req.confirm,
+                confirm_rounds=req.confirm_rounds,
+                confirm_glimpse=req.confirm_glimpse,
+            )
+            result = fut.result(timeout=timeout_s)
         elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    except FuturesTimeoutError:
+        details = f"chat pipeline exceeded timeout of {timeout_s} seconds"
+        return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": details})
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail={"error": "manifest_not_found", "detail": str(exc)}) from exc
+        return JSONResponse(status_code=404, content={"error": "manifest_not_found", "details": str(exc)})
     except Exception as exc:
-        raise HTTPException(status_code=500, detail={"error": "chat_failed", "detail": f"Error consultando RAG: {exc}"}) from exc
+        return JSONResponse(status_code=500, content={"error": "chat_failed", "details": str(exc)})
 
     answer = str(result.get("answer", ""))
     references = list(result.get("references", []) or [])
     selected_categories = list(result.get("selected_categories", []) or [])
 
+    payload = {
+        "answer": answer,
+        "references": references,
+        "selected_categories": selected_categories,
+    }
+
     if req.debug:
-        debug_info = {
-            "timings": {
-                "total_ms": elapsed_ms,
-            },
+        payload["debug_info"] = {
+            "timings": {"total_ms": elapsed_ms, "timeout_s": timeout_s},
             "selected_categories": selected_categories,
             "references": references,
-            "pipeline": {
-                k: v
-                for k, v in result.items()
-                if k not in {"answer", "references", "selected_categories"}
-            },
+            "pipeline": {k: v for k, v in result.items() if k not in {"answer", "references", "selected_categories"}},
         }
-        return ChatResponse(
-            answer=answer,
-            references=references,
-            selected_categories=selected_categories,
-            debug_info=debug_info,
-        )
 
-    return ChatResponse(answer=answer, references=references)
+    return JSONResponse(status_code=200, content=payload)
 
 
 @app.post("/api/upload", response_model=UploadResponse)

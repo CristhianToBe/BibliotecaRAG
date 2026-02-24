@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -292,7 +293,16 @@ def pro_query_with_meta(
         all_hits = merge_and_dedupe_evidence(all_hits)
         all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
 
+    if debug:
+        from .llm import eprint
+
+        eprint("[DEBUG] answer generation start (with-meta)")
+    answer_started_at = time.perf_counter()
     answer = write_answer(q_final, all_hits[:30], debug=debug)
+    if debug:
+        from .llm import eprint
+
+        eprint(f"[DEBUG] answer generation end (with-meta) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
     references = _collect_references(manifest, all_hits)
 
     return {
@@ -448,7 +458,16 @@ def pro_query_non_interactive(
         all_hits = merge_and_dedupe_evidence(all_hits)
         all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
 
+    if debug:
+        from .llm import eprint
+
+        eprint("[DEBUG] answer generation start (non-interactive)")
+    answer_started_at = time.perf_counter()
     answer = write_answer(q_final, all_hits[:30], debug=debug)
+    if debug:
+        from .llm import eprint
+
+        eprint(f"[DEBUG] answer generation end (non-interactive) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
     references = _collect_references(manifest, all_hits)
 
     return {
