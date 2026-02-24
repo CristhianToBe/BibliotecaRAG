@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -60,8 +61,9 @@ class DocReference(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    selected_categories: list[str]
     references: list[DocReference]
+    selected_categories: list[str] | None = None
+    debug_info: dict | None = None
 
 
 class UploadResponse(BaseModel):
@@ -124,6 +126,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail={"error": "invalid_question", "detail": "question no puede estar vacía"})
 
     try:
+        started_at = time.perf_counter()
         result = pro_query_non_interactive(
             q,
             manifest_path=req.manifest_path,
@@ -133,16 +136,37 @@ def chat(req: ChatRequest) -> ChatResponse:
             confirm_rounds=req.confirm_rounds,
             confirm_glimpse=req.confirm_glimpse,
         )
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail={"error": "manifest_not_found", "detail": str(exc)}) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail={"error": "chat_failed", "detail": f"Error consultando RAG: {exc}"}) from exc
 
-    return ChatResponse(
-        answer=str(result.get("answer", "")),
-        selected_categories=list(result.get("selected_categories", []) or []),
-        references=list(result.get("references", []) or []),
-    )
+    answer = str(result.get("answer", ""))
+    references = list(result.get("references", []) or [])
+    selected_categories = list(result.get("selected_categories", []) or [])
+
+    if req.debug:
+        debug_info = {
+            "timings": {
+                "total_ms": elapsed_ms,
+            },
+            "selected_categories": selected_categories,
+            "references": references,
+            "pipeline": {
+                k: v
+                for k, v in result.items()
+                if k not in {"answer", "references", "selected_categories"}
+            },
+        }
+        return ChatResponse(
+            answer=answer,
+            references=references,
+            selected_categories=selected_categories,
+            debug_info=debug_info,
+        )
+
+    return ChatResponse(answer=answer, references=references)
 
 
 @app.post("/api/upload", response_model=UploadResponse)
