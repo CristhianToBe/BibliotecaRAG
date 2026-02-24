@@ -170,17 +170,18 @@ def content_based_categorize(client, model: str, file_id: str, tmp_vs_id: str, f
 
     return obj
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("path", help="Ruta del documento (PDF recomendado)")
-    ap.add_argument("--title", default="", help="Título opcional")
-    ap.add_argument("--author", default="", help="Autor opcional")
-    ap.add_argument("--tags", default="", help="Tags separados por coma")
-    ap.add_argument("--copy", action="store_true", help="Copiar a la biblioteca (recomendado)")
-    ap.add_argument("--debug", action="store_true", help="Logging verbose")
-    args = ap.parse_args()
 
-    setup_logging(debug=args.debug)
+def ingest_document(
+    path: str | Path,
+    *,
+    title: str = "",
+    author: str = "",
+    tags: List[str] | None = None,
+    copy_to_library: bool = False,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Ingesta un documento y devuelve metadata útil para CLI y API web."""
+    setup_logging(debug=debug)
 
     client = get_client()
     settings = get_openai_settings()
@@ -191,7 +192,7 @@ def main() -> None:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.library_dir.mkdir(parents=True, exist_ok=True)
 
-    src = Path(args.path).resolve()
+    src = Path(path).resolve()
     if not src.exists():
         raise FileNotFoundError(src)
 
@@ -200,15 +201,17 @@ def main() -> None:
     manifest_now = load_manifest(cfg.manifest_path)
     existing_doc = find_doc_by_sha256(manifest_now, src_hash)
     if existing_doc and existing_doc.abs_path and Path(existing_doc.abs_path).exists():
-        print(" Ya existe en la biblioteca (mismo contenido). No se re-indexa.")
-        print(" - doc_id:", existing_doc.doc_id)
-        print(" - archivo:", existing_doc.abs_path)
-        print(" - categoria:", existing_doc.category)
-        return
+        return {
+            "status": "already_exists",
+            "doc_id": existing_doc.doc_id,
+            "abs_path": existing_doc.abs_path,
+            "category": existing_doc.category,
+            "manifest_path": str(cfg.manifest_path),
+        }
 
-    title = args.title.strip() or src.stem
-    author = args.author.strip()
-    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    title_clean = title.strip() or src.stem
+    author_clean = author.strip()
+    tags_clean = [t.strip() for t in (tags or []) if t and t.strip()]
 
     manifest = manifest_now  # seguimos usando el mismo objeto
 
@@ -222,7 +225,7 @@ def main() -> None:
     attach_and_wait(client, tmp_vs_id, file_id)
 
     # 3) Categorizar leyendo contenido real
-    cat = content_based_categorize(client, model, file_id, tmp_vs_id, src.name, title, author)
+    cat = content_based_categorize(client, model, file_id, tmp_vs_id, src.name, title_clean, author_clean)
 
     if cat.get("work_relevance", 0.0) < 0.35:
         raise RuntimeError(
@@ -235,7 +238,7 @@ def main() -> None:
     category_folder.mkdir(parents=True, exist_ok=True)
 
     # 4) Copiar (opcional) a carpeta final
-    final_path = safe_copy(src, category_folder) if args.copy else src
+    final_path = safe_copy(src, category_folder) if copy_to_library else src
 
     # 5) VS por categoría
     vs_id = ensure_category_vector_store(client, manifest, category_name, category_folder)
@@ -261,9 +264,9 @@ def main() -> None:
         filename=final_path.name,
         abs_path=str(final_path),
         category=category_name,
-        title=title,
-        author=author,
-        tags=tags,
+        title=title_clean,
+        author=author_clean,
+        tags=tags_clean,
         openai_file_id=file_id,
         vector_store_id=vs_id,
         sha256=src_hash,
@@ -272,15 +275,54 @@ def main() -> None:
     ))
 
     save_manifest(cfg.manifest_path, manifest)
+    return {
+        "status": "ingested",
+        "category": category_name,
+        "category_label": cat.get("category_label", ""),
+        "topics": list(cat.get("topics", []) or []),
+        "folder": str(category_folder),
+        "vector_store_id": vs_id,
+        "openai_file_id": file_id,
+        "doc_id": doc_id,
+        "keywords": list(cat.get("keywords", []) or []),
+        "manifest_path": str(cfg.manifest_path),
+    }
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", help="Ruta del documento (PDF recomendado)")
+    ap.add_argument("--title", default="", help="Título opcional")
+    ap.add_argument("--author", default="", help="Autor opcional")
+    ap.add_argument("--tags", default="", help="Tags separados por coma")
+    ap.add_argument("--copy", action="store_true", help="Copiar a la biblioteca (recomendado)")
+    ap.add_argument("--debug", action="store_true", help="Logging verbose")
+    args = ap.parse_args()
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    result = ingest_document(
+        args.path,
+        title=args.title,
+        author=args.author,
+        tags=tags,
+        copy_to_library=args.copy,
+        debug=args.debug,
+    )
+
+    if result["status"] == "already_exists":
+        print(" Ya existe en la biblioteca (mismo contenido). No se re-indexa.")
+        print(" - doc_id:", result["doc_id"])
+        print(" - archivo:", result["abs_path"])
+        print(" - categoria:", result["category"])
+        return
 
     print(" Ingestado (content-based)")
-    print(" - category:", category_name, "|", cat.get("category_label", ""))
-    print(" - topics:", ", ".join(cat.get("topics", [])))
-    print(" - folder:", category_folder)
-    print(" - vector_store_id:", vs_id)
-    print(" - openai_file_id:", file_id)
-    print(" - doc_id:", doc_id)
-    print(" - keywords:", ", ".join(cat.get("keywords", [])))
+    print(" - category:", result["category"], "|", result.get("category_label", ""))
+    print(" - topics:", ", ".join(result.get("topics", [])))
+    print(" - folder:", result["folder"])
+    print(" - vector_store_id:", result["vector_store_id"])
+    print(" - openai_file_id:", result["openai_file_id"])
+    print(" - doc_id:", result["doc_id"])
+    print(" - keywords:", ", ".join(result.get("keywords", [])))
 
 if __name__ == "__main__":
     main()
