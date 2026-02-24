@@ -197,8 +197,21 @@ def confirm_loop_non_interactive(
         debug=debug,
     )
 
+    action = str(decision.get("action") or "REFINE").strip().upper()
     cats_final = list(decision.get("categories_final") or [])
+    valid_set = set(valid)
+    cats_final = [c for c in cats_final if c in valid_set]
+    if debug:
+        eprint(f"[DEBUG] non-interactive confirm action: {action}")
+        eprint(f"[DEBUG] non-interactive confirm categories_final: {cats_final}")
+
+    # Non-interactive policy: never block on actions requiring user input.
+    # Always continue with best available categories.
     if not cats_final:
-        cats_final = [c for c in suggested if c in set(valid)]
+        cats_final = [c for c in suggested if c in valid_set]
+
+
+    if debug:
+        eprint(f"[DEBUG] non-interactive chosen categories after fallback: {cats_final}")
 
     return (question, cats_final, picked)
