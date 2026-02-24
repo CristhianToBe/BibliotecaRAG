@@ -5,9 +5,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from worklib.store import Manifest
 
-from .llm import call_text, eprint, clip, MODEL_CONFIRM, SYSTEM_CONFIRM
-from .retrieve import retrieve_via_tool
+from .llm import MODEL_CONFIRM, SYSTEM_CONFIRM, call_text, clip, eprint
 from .pick import pick_categories
+from .retrieve import retrieve_via_tool
 
 
 def _safe_json_load(s: str) -> Dict[str, Any]:
@@ -18,7 +18,7 @@ def _safe_json_load(s: str) -> Dict[str, Any]:
         i = s.find("{")
         j = s.rfind("}")
         if i >= 0 and j > i:
-            return json.loads(s[i:j + 1])
+            return json.loads(s[i : j + 1])
         raise
 
 
@@ -68,6 +68,37 @@ def confirm_decision(
     }
 
 
+def _build_glimpses(
+    manifest: Manifest,
+    suggested: List[str],
+    question: str,
+) -> List[Dict[str, Any]]:
+    glimpses: List[Dict[str, Any]] = []
+    for cname in suggested[:2]:
+        cat = manifest.categories.get(cname)
+        vs_id = getattr(cat, "vector_store_id", "") if cat else ""
+        if not vs_id:
+            continue
+        try:
+            hits = retrieve_via_tool([vs_id], question, max_num_results=2, debug=False)
+        except Exception:
+            hits = []
+        glimpses.append(
+            {
+                "category": cname,
+                "hits": [
+                    {
+                        "title": (h.get("filename") or h.get("file_id") or ""),
+                        "snippet": clip(h.get("text") or "", 280),
+                        "score": h.get("score"),
+                    }
+                    for h in hits[:2]
+                ],
+            }
+        )
+    return glimpses
+
+
 def confirm_loop(
     question: str,
     *,
@@ -88,28 +119,7 @@ def confirm_loop(
     for _ in range(max_rounds):
         glimpses: List[Dict[str, Any]] = []
         if use_glimpse and suggested:
-            for cname in suggested[:2]:
-                cat = manifest.categories.get(cname)
-                vs_id = getattr(cat, "vector_store_id", "") if cat else ""
-                if not vs_id:
-                    continue
-                try:
-                    hits = retrieve_via_tool([vs_id], q_curr, max_num_results=2, debug=False)
-                except Exception:
-                    hits = []
-                glimpses.append(
-                    {
-                        "category": cname,
-                        "hits": [
-                            {
-                                "title": (h.get("filename") or h.get("file_id") or ""),
-                                "snippet": clip(h.get("text") or "", 280),
-                                "score": h.get("score"),
-                            }
-                            for h in hits[:2]
-                        ],
-                    }
-                )
+            glimpses = _build_glimpses(manifest, suggested, q_curr)
 
         prompt_dec = confirm_decision(
             q_curr,
@@ -159,3 +169,36 @@ def confirm_loop(
             continue
 
     return (q_curr, suggested, picked_curr)
+
+
+def confirm_loop_non_interactive(
+    question: str,
+    *,
+    picked: Dict[str, Any],
+    manifest: Manifest,
+    use_glimpse: bool = True,
+    debug: bool = False,
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    """Non-interactive confirm flow for server/API usage.
+
+    This never asks for console input. We automatically accept the model proposal
+    from the first confirm step by default.
+    """
+    valid = list(manifest.categories.keys())
+    suggested = list(picked.get("selected", []) or [])[:2]
+    glimpses: List[Dict[str, Any]] = _build_glimpses(manifest, suggested, question) if (use_glimpse and suggested) else []
+
+    decision = confirm_decision(
+        question,
+        suggested=suggested,
+        valid_categories=valid,
+        glimpses=glimpses,
+        user_reply="",
+        debug=debug,
+    )
+
+    cats_final = list(decision.get("categories_final") or [])
+    if not cats_final:
+        cats_final = [c for c in suggested if c in set(valid)]
+
+    return (question, cats_final, picked)

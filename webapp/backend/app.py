@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
-from worklib.query.pipeline import pro_query_with_meta
+from worklib.query.pipeline import pro_query_non_interactive
 
 load_dotenv()
 
@@ -124,7 +124,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail={"error": "invalid_question", "detail": "question no puede estar vacía"})
 
     try:
-        result = pro_query_with_meta(
+        result = pro_query_non_interactive(
             q,
             manifest_path=req.manifest_path,
             max_workers=req.max_workers,
