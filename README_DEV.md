@@ -2,6 +2,17 @@
 
 Guía rápida para desarrollo local de la web app (backend FastAPI + frontend estático).
 
+## Quick start
+
+Haz doble clic en `run_app.bat` desde la raíz del repositorio.
+
+El launcher:
+
+- activa `.venv` si existe,
+- inicia el backend (`uvicorn`) en `127.0.0.1:8000`,
+- inicia el frontend estático en `127.0.0.1:5173`,
+- abre `http://127.0.0.1:5173/index.html` en el navegador.
+
 ## 1) Requisitos
 
 - Windows 10/11
