@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from pathlib import Path
-
 from worklib.config import default_config
-from worklib.store import load_manifest, Manifest
+from worklib.store import Doc, Manifest, load_manifest
 
-from .pick import pick_categories
+from .arbitrate import arbitrate
 from .confirm import confirm_loop
+from .paths import resolve_local_path
+from .pick import pick_categories
 from .refine import refine_all
 from .retrieve import retrieve_via_tool
-from .arbitrate import arbitrate
 from .write import write_answer
-from .paths import resolve_local_path
 
 
 def _default_manifest_path() -> str:
@@ -55,6 +54,7 @@ def merge_and_dedupe_evidence(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]
         out.append(h)
     return out
 
+
 def attach_local_paths(
     manifest: Manifest,
     hits: List[Dict[str, Any]],
@@ -74,7 +74,56 @@ def attach_local_paths(
         out.append(hh)
     return out
 
-def pro_query(
+
+def _find_doc_reference(manifest: Manifest, hit: Dict[str, Any]) -> Optional[Doc]:
+    fid = str(hit.get("file_id") or "").strip()
+    local_path = str(hit.get("local_path") or "").strip()
+    filename = str(hit.get("filename") or "").strip().lower()
+
+    docs = manifest.docs.values() if isinstance(manifest.docs, dict) else []
+
+    if fid:
+        for d in docs:
+            if str(getattr(d, "openai_file_id", "") or "").strip() == fid:
+                return d
+
+    if local_path:
+        for d in docs:
+            if str(getattr(d, "abs_path", "") or "").strip() == local_path:
+                return d
+
+    if filename:
+        for d in docs:
+            if str(getattr(d, "filename", "") or "").strip().lower() == filename:
+                return d
+
+    return None
+
+
+def _collect_references(manifest: Manifest, hits: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    refs: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    for h in hits:
+        d = _find_doc_reference(manifest, h)
+        if not d:
+            continue
+        doc_id = str(getattr(d, "doc_id", "") or "").strip()
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        refs.append(
+            {
+                "doc_id": doc_id,
+                "filename": str(getattr(d, "filename", "") or ""),
+                "abs_path": str(getattr(d, "abs_path", "") or ""),
+            }
+        )
+
+    return refs
+
+
+def pro_query_with_meta(
     question: str,
     *,
     manifest_path: Optional[str] = None,
@@ -83,14 +132,13 @@ def pro_query(
     confirm: bool = True,
     confirm_rounds: int = 4,
     confirm_glimpse: bool = True,
-) -> str:
+) -> Dict[str, Any]:
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
 
-    # si tu manifest tiene un path base, úsalo; si no, usa el padre del manifest como fallback
     library_root = None
     try:
-        library_root = Path(mp).parent  # ajusta si tú tienes un root específico
+        library_root = Path(mp).parent
     except Exception:
         library_root = None
 
@@ -140,4 +188,33 @@ def pro_query(
         all_hits = merge_and_dedupe_evidence(all_hits)
         all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
 
-    return write_answer(q_final, all_hits[:30], debug=debug)
+    answer = write_answer(q_final, all_hits[:30], debug=debug)
+    references = _collect_references(manifest, all_hits)
+
+    return {
+        "answer": answer,
+        "selected_categories": list(cats_final or []),
+        "references": references,
+    }
+
+
+def pro_query(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> str:
+    data = pro_query_with_meta(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        confirm=confirm,
+        confirm_rounds=confirm_rounds,
+        confirm_glimpse=confirm_glimpse,
+    )
+    return str(data.get("answer", ""))

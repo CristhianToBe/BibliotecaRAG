@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BibliotecaRAG Web</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #122; }
+      .wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+      .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+      .card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+      .row { margin-bottom: 10px; }
+      input, textarea, button { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccd; }
+      button { cursor: pointer; background: #1f6feb; color: white; border: none; }
+      button:disabled { background: #9db7e8; }
+      .chat { min-height: 260px; max-height: 460px; overflow: auto; border: 1px solid #e5e9f2; border-radius: 8px; padding: 10px; background: #fafcff; margin-bottom: 10px; }
+      .msg { margin: 8px 0 14px; white-space: pre-wrap; }
+      .msg.you { color: #0b5394; }
+      .msg.bot { color: #1a1a1a; }
+      .small { font-size: 12px; color: #667; }
+      .citations { margin-top: 6px; padding-left: 18px; }
+      .citations li { margin-bottom: 4px; }
+      .progress { width: 100%; background: #e9edf6; border-radius: 8px; overflow: hidden; height: 10px; margin-top: 8px; }
+      .progress > div { height: 100%; background: #1f6feb; transition: width 0.2s; }
+      .ok { color: #176b2f; }
+      .err { color: #b42318; }
+      @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div id="app" class="wrap">
+      <h1>BibliotecaRAG Web</h1>
+      <p class="small">Chat + upload sobre el mismo motor Python de CLI (sin shell out).</p>
+      <div class="grid">
+        <section class="card">
+          <h2>Chat</h2>
+          <div class="chat">
+            <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="m.role === 'you' ? 'you' : 'bot'">
+              <strong>{{ m.role === 'you' ? 'Tú' : 'RAG' }}:</strong> {{ m.text }}
+              <div class="small" v-if="m.selectedCategories && m.selectedCategories.length">
+                Categorías: {{ m.selectedCategories.join(', ') }}
+              </div>
+              <ul class="citations small" v-if="m.references && m.references.length">
+                <li v-for="(r, ridx) in m.references" :key="`${idx}-${ridx}`">
+                  <strong>{{ r.filename || '(sin nombre)' }}</strong> · doc_id={{ r.doc_id || '-' }}
+                  <div>{{ r.abs_path || '-' }}</div>
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div class="row">
+            <textarea v-model="question" rows="3" placeholder="Haz una pregunta..."></textarea>
+          </div>
+          <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">
+            {{ loadingChat ? 'Consultando...' : 'Enviar pregunta' }}
+          </button>
+        </section>
+
+        <section class="card">
+          <h2>Upload</h2>
+          <div class="row"><input v-model="title" placeholder="Título (opcional)" /></div>
+          <div class="row"><input v-model="author" placeholder="Autor (opcional)" /></div>
+          <div class="row"><input v-model="tags" placeholder="Tags separadas por coma" /></div>
+          <div class="row"><input type="file" @change="onFile" /></div>
+          <button @click="uploadFile" :disabled="loadingUpload || !selectedFile">
+            {{ loadingUpload ? 'Ingestando...' : 'Subir documento' }}
+          </button>
+          <div class="progress" v-if="loadingUpload">
+            <div :style="{ width: uploadProgress + '%' }"></div>
+          </div>
+          <p class="small" :class="uploadOk ? 'ok' : 'err'" v-if="uploadStatus">{{ uploadStatus }}</p>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const { createApp } = Vue;
+
+      createApp({
+        data() {
+          return {
+            question: "",
+            messages: [],
+            loadingChat: false,
+            selectedFile: null,
+            title: "",
+            author: "",
+            tags: "",
+            loadingUpload: false,
+            uploadProgress: 0,
+            uploadStatus: "",
+            uploadOk: false,
+          };
+        },
+        methods: {
+          extractError(data, fallback) {
+            if (!data) return fallback;
+            if (typeof data.detail === 'string') return data.detail;
+            if (data.detail && data.detail.detail) return data.detail.detail;
+            if (data.detail && data.detail.error) return `${data.detail.error}: ${data.detail.detail || ''}`;
+            return fallback;
+          },
+          async sendQuestion() {
+            const q = this.question.trim();
+            if (!q || this.loadingChat) return;
+            this.messages.push({ role: "you", text: q });
+            this.question = "";
+            this.loadingChat = true;
+            try {
+              const r = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: q }),
+              });
+              const data = await r.json();
+              if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
+              this.messages.push({
+                role: "bot",
+                text: data.answer || "(sin respuesta)",
+                selectedCategories: data.selected_categories || [],
+                references: data.references || [],
+              });
+            } catch (e) {
+              this.messages.push({ role: "bot", text: `Error: ${e.message}`, references: [] });
+            } finally {
+              this.loadingChat = false;
+            }
+          },
+          onFile(event) {
+            this.selectedFile = event.target.files?.[0] || null;
+          },
+          uploadFile() {
+            if (!this.selectedFile || this.loadingUpload) return;
+            this.loadingUpload = true;
+            this.uploadProgress = 0;
+            this.uploadStatus = '';
+            this.uploadOk = false;
+
+            const form = new FormData();
+            form.append('file', this.selectedFile);
+            form.append('title', this.title);
+            form.append('author', this.author);
+            form.append('tags', this.tags);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload');
+
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) {
+                this.uploadProgress = Math.round((e.loaded / e.total) * 100);
+              }
+            };
+
+            xhr.onload = () => {
+              this.loadingUpload = false;
+              let data = {};
+              try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
+              if (xhr.status >= 200 && xhr.status < 300) {
+                const detail = data.detail || {};
+                this.uploadOk = true;
+                this.uploadStatus = `OK (${detail.status || 'ingested'}) · categoría=${detail.category || '-'} · doc_id=${detail.doc_id || '-'}`;
+                this.uploadProgress = 100;
+              } else {
+                this.uploadOk = false;
+                this.uploadStatus = `Error: ${this.extractError(data, 'Error en upload')}`;
+              }
+            };
+
+            xhr.onerror = () => {
+              this.loadingUpload = false;
+              this.uploadOk = false;
+              this.uploadStatus = 'Error de red durante el upload';
+            };
+
+            xhr.send(form);
+          },
+        },
+      }).mount('#app');
+    </script>
+  </body>
+</html>
