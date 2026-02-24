@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_manifest.build_parser(sp)
     rebuild_versioned.build_parser(sp)
     fill_vectorstores.build_parser(sp)
+    fill_vectorstores.build_parser_alias(sp)
     fill_keywords.build_parser(sp)
     delete_old_vectorstore_files.build_parser(sp)
     orchestrate.build_parser(sp)
