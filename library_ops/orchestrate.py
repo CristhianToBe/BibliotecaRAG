@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
 from . import rebuild_versioned, fill_vectorstores, fill_keywords, delete_old_vectorstore_files
+
+
+def _log_step(status: str, step_name: str, detail: str = "") -> None:
+    suffix = f" | {detail}" if detail else ""
+    print(f"{status}: {step_name}{suffix}")
+
+
+def _discover_manifests() -> tuple[Optional[Path], Optional[Path]]:
+    """Retorna (new_manifest, old_manifest) a partir de library_dir/vN."""
+    from worklib.config import default_config
+
+    cfg = default_config()
+    lib_dir = Path(cfg.library_dir)
+    versions = sorted([p for p in lib_dir.glob("v*") if p.is_dir()], key=lambda p: p.name)
+    if not versions:
+        return None, None
+
+    new_manifest = versions[-1] / "_state" / "library.json"
+    previous_manifest: Optional[Path] = None
+    if len(versions) > 1:
+        previous_manifest = versions[-2] / "_state" / "library.json"
+    return new_manifest, previous_manifest
 
 def run(
     *,
@@ -24,8 +46,25 @@ def run(
     old_manifest: Optional[Path],
     skip_vs: str,
 ) -> int:
+    steps = [
+        ("rebuild_library_versioned", True, ""),
+        ("fill_category_vectorstores", not dry_run, "dry-run mode" if dry_run else ""),
+        ("fill_category_keywords", not dry_run, "dry-run mode" if dry_run else ""),
+        ("delete_old_vectorstore_files", not dry_run, "dry-run mode" if dry_run else ""),
+    ]
+
+    if dry_run:
+        print("\n=== ORCHESTRATION PLAN (dry-run) ===")
+        for step_name, should_run, reason in steps:
+            plan_label = "WOULD RUN" if should_run else "WOULD SKIP"
+            detail = reason or "enabled"
+            print(f"PLAN: {step_name}: {plan_label} ({detail})")
+
+    vectorstores_ran = False
+    delete_ran = False
+
     # 1) rebuild
-    print("\n=== STEP 1: rebuild-versioned ===")
+    _log_step("STEP START", "rebuild_library_versioned")
     rc = rebuild_versioned.run(
         manifest_override=manifest,
         apply=(apply and (not dry_run)),
@@ -39,66 +78,95 @@ def run(
         create_vector_stores=False,
     )
     if rc != 0:
+        _log_step("STEP DONE", "rebuild_library_versioned", f"rc={rc}")
         return rc
+    _log_step("STEP DONE", "rebuild_library_versioned")
 
-    # figure out newest version folder to find its _state/library.json
-    # We rely on worklib.config.default_config().library_dir = .../Biblioteca/biblioteca
-    from worklib.config import default_config
-    cfg = default_config()
-    lib_dir = Path(cfg.library_dir)
-    versions = sorted([p for p in lib_dir.glob('v*') if p.is_dir()], key=lambda p: p.name)
-    if not versions:
+    new_manifest, discovered_old_manifest = _discover_manifests()
+    if not new_manifest:
         print("❌ No encontré carpetas vN en library_dir")
         return 2
-    newest = versions[-1]
-    new_manifest = newest / "_state" / "library.json"
     if not new_manifest.exists():
         print(f"❌ No encontré manifest generado: {new_manifest}")
         return 2
 
-    # 2) fill vectorstores + keywords in parallel
-    print("\n=== STEP 2: fill-vectorstores + fill-keywords (parallel) ===")
-    tasks = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        tasks.append(ex.submit(
-            fill_vectorstores.run,
-            manifest=new_manifest,
-            out=None,
-            only_empty=only_empty_vectorstores,
-            dry_run=dry_run,
-            debug=debug,
-            vs_name_prefix=vs_name_prefix,
-            file_batch_size=file_batch_size,
-            upload_missing=upload_missing,
-            max_cats=0,
-        ))
-        tasks.append(ex.submit(
-            fill_keywords.run,
-            manifest=new_manifest,
-            out=None,
-            model="gpt-5-nano",
-            per_category_docs=4,
-            max_chars_per_doc=10000,
-            only_empty=only_empty_keywords,
-            debug=debug,
-        ))
-        for fut in as_completed(tasks):
-            rc2 = fut.result()
-            if rc2 != 0:
-                return rc2
+    old_manifest_to_use = old_manifest or discovered_old_manifest
+    if not old_manifest:
+        if old_manifest_to_use:
+            _log_step("STEP SKIPPED", "old_manifest_override", f"using auto-discovered {old_manifest_to_use}")
+        else:
+            _log_step("STEP SKIPPED", "old_manifest_override", "no override provided")
 
-    # 3) delete old files from old manifest
-    if old_manifest:
-        print("\n=== STEP 3: delete-old-vs-files ===")
+    if dry_run:
+        _log_step("STEP SKIPPED", "fill_category_vectorstores", "dry-run mode")
+        _log_step("STEP SKIPPED", "fill_category_keywords", "dry-run mode")
+    else:
+        # 2) fill vectorstores + keywords in parallel
+        _log_step("STEP START", "fill_category_vectorstores")
+        _log_step("STEP START", "fill_category_keywords")
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            future_vs = ex.submit(
+                fill_vectorstores.run,
+                manifest=new_manifest,
+                out=None,
+                only_empty=only_empty_vectorstores,
+                dry_run=dry_run,
+                debug=debug,
+                vs_name_prefix=vs_name_prefix,
+                file_batch_size=file_batch_size,
+                upload_missing=upload_missing,
+                max_cats=0,
+            )
+            future_kw = ex.submit(
+                fill_keywords.run,
+                manifest=new_manifest,
+                out=None,
+                model="gpt-5-nano",
+                per_category_docs=4,
+                max_chars_per_doc=10000,
+                only_empty=only_empty_keywords,
+                debug=debug,
+            )
+
+            rc_vs = future_vs.result()
+            rc_kw = future_kw.result()
+
+        _log_step("STEP DONE", "fill_category_vectorstores", f"rc={rc_vs}")
+        _log_step("STEP DONE", "fill_category_keywords", f"rc={rc_kw}")
+        vectorstores_ran = True
+
+        if rc_vs != 0:
+            return rc_vs
+        if rc_kw != 0:
+            return rc_kw
+
+    if dry_run:
+        _log_step("STEP SKIPPED", "delete_old_vectorstore_files", "dry-run mode")
+    elif not old_manifest_to_use:
+        _log_step("STEP DONE", "delete_old_vectorstore_files", "rc=1")
+        print("❌ STEP FAILED: delete_old_vectorstore_files requires an old manifest (override or auto-discovered previous version).")
+        return 1
+    else:
+        _log_step("STEP START", "delete_old_vectorstore_files")
         rc3 = delete_old_vectorstore_files.run(
-            manifest=old_manifest,
+            manifest=old_manifest_to_use,
             dry_run=dry_run,
             debug=debug,
             sleep_ms=0,
             max_deletes=0,
             skip_vs=skip_vs,
         )
-        return rc3
+        _log_step("STEP DONE", "delete_old_vectorstore_files", f"rc={rc3}")
+        delete_ran = True
+        if rc3 != 0:
+            return rc3
+
+    if not dry_run and not vectorstores_ran:
+        print("❌ STEP FAILED: fill_category_vectorstores did not run in non-dry-run mode.")
+        return 1
+    if not dry_run and not delete_ran:
+        print("❌ STEP FAILED: delete_old_vectorstore_files did not run in non-dry-run mode.")
+        return 1
 
     print("\n✅ Orchestrate listo.")
     return 0
