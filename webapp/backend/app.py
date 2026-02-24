@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -93,16 +93,6 @@ app.add_middleware(
 )
 
 frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
-if frontend_dir.exists():
-    app.mount("/assets", StaticFiles(directory=str(frontend_dir)), name="frontend-assets")
-
-
-@app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    index_file = frontend_dir / "index.html"
-    if not index_file.exists():
-        raise HTTPException(status_code=404, detail="Frontend no encontrado")
-    return FileResponse(index_file)
 
 
 @app.get("/api/health")
@@ -221,3 +211,7 @@ async def upload(
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+if frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

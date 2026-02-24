@@ -1,6 +1,6 @@
 # README_DEV (Windows)
 
-Guía rápida para desarrollo local de la web app (backend FastAPI + frontend estático).
+Guía rápida para desarrollo local de la web app con servidor único (FastAPI sirve API + frontend).
 
 ## Quick start
 
@@ -10,8 +10,7 @@ El launcher:
 
 - activa `.venv` si existe,
 - inicia el backend (`uvicorn`) en `127.0.0.1:8000`,
-- inicia el frontend estático en `127.0.0.1:5173`,
-- abre `http://127.0.0.1:5173/index.html` en el navegador.
+- abre `http://127.0.0.1:8000/` en el navegador (frontend servido por FastAPI).
 
 ## 1) Requisitos
 
@@ -48,13 +47,15 @@ Opcionalmente ajusta rutas y límites web:
 - `WEBAPP_UPLOAD_MAX_BYTES` (ej: `26214400` = 25MB)
 - `WEBAPP_UPLOAD_DIR` (default `uploads`)
 
-## 4) Ejecutar backend
+## 4) Ejecutar app (API + frontend)
 
 ```powershell
 uvicorn webapp.backend.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Abre: `http://127.0.0.1:8000/`
+Health: `http://127.0.0.1:8000/api/health`
+
+Frontend: `http://127.0.0.1:8000/`
 
 ## 5) Checks rápidos
 
