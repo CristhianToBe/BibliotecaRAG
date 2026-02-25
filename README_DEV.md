@@ -57,6 +57,10 @@ Health: `http://127.0.0.1:8000/api/health`
 
 Frontend: `http://127.0.0.1:8000/`
 
+
+> Recomendación: abre siempre `http://127.0.0.1:8000/` (frontend servido por FastAPI).
+> Evita abrir `file://...` o un `http.server` separado salvo que configures `API_BASE` apuntando al backend.
+
 ## 5) Checks rápidos
 
 ```powershell
@@ -99,3 +103,13 @@ Debug:
 
 - En `/api/chat` con `debug=true`, la respuesta incluye `trace_id`, timings por etapa, tiempos de retrieval por categoría y resumen de llamadas de modelo.
 - En el frontend, **Categorías manuales** ahora funciona como autocomplete con chips: puedes escribir, filtrar y seleccionar múltiples categorías; el payload se envía en `manual_categories` como string separado por `+` (ej: `laboral+tributario`).
+- En requests de chat, `manual_categories` se envía a nivel superior del JSON (no dentro de `pipeline`).
+
+
+## 7) Verificación manual mínima de Picker/categorías
+
+Pruebas rápidas recomendadas en la UI o por API:
+
+- **Picker ON + categorías manuales vacías** => **OK** (no debe devolver 400).
+- **Picker OFF + categorías manuales vacías** => **400** con `missing_minimum`.
+- **Picker OFF + categorías manuales completas** => **OK**.
