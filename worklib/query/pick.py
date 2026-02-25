@@ -6,7 +6,7 @@ from typing import Any, Dict
 from worklib.store import Category
 from worklib.prompt_loader import load_prompt
 
-from .llm import call_text, eprint, MODEL_SMART
+from .llm import call_text, eprint, MODEL_PICK
 
 SYSTEM_PICK = load_prompt("query_pick_system")
 
@@ -14,7 +14,7 @@ SYSTEM_PICK = load_prompt("query_pick_system")
 def pick_categories(question: str, cats: Dict[str, Category], *, debug: bool = False) -> Dict[str, Any]:
     cat_view = {k: {"keywords": v.keywords[:25]} for k, v in cats.items()}
     payload = {"question": question, "categories": cat_view}
-    resp = call_text(MODEL_SMART, SYSTEM_PICK, json.dumps(payload, ensure_ascii=False), debug=debug)
+    resp = call_text(MODEL_PICK, SYSTEM_PICK, json.dumps(payload, ensure_ascii=False), debug=debug)
     txt = resp.output_text or ""
     if debug:
         eprint("\n[DEBUG] pick_categories raw output_text:")

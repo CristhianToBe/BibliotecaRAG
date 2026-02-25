@@ -73,3 +73,28 @@ python ingest_auto.py C:\ruta\documento.pdf --copy
 python query_auto.py "¿Cuál es la política de vacaciones?"
 python -m library_ops --help
 ```
+
+## Performance tuning
+
+Variables clave para latencia de `/api/chat`:
+
+- `WEBAPP_CHAT_TIMEOUT_S` (default `90`): timeout total por request.
+- `WEBAPP_RETRIEVE_TIMEOUT_S` (default `20`): timeout por retrieval/categoría.
+- `WEBAPP_ANSWER_TIMEOUT_S` (default `45`): timeout de generación de respuesta.
+- `WEBAPP_MAX_CATEGORIES` (default `2`): máximo categorías a consultar.
+- `WEBAPP_TOP_K` (default `8`): resultados por vector store.
+- `WEBAPP_MAX_PROMPT_CHARS` (default `12000`): máximo de caracteres de evidencia enviados al modelo de respuesta.
+- `WEBAPP_RETRIEVAL_CACHE_TTL_S` (default `1800`): TTL cache retrieval.
+- `WEBAPP_PICK_CACHE_TTL_S` (default `600`): TTL cache pick.
+
+Selección de modelos (latencia-optimized por defecto):
+
+- `MODEL_PICK` (default `gpt-5-nano`)
+- `MODEL_CONFIRM` (default `gpt-5-nano`)
+- `MODEL_REFINE` (default `gpt-5-nano`)
+- `MODEL_ANSWER` (default `gpt-5-mini`)
+- `MODEL_ARBITRATE` (default = `MODEL_ANSWER`)
+
+Debug:
+
+- En `/api/chat` con `debug=true`, la respuesta incluye `trace_id`, timings por etapa, tiempos de retrieval por categoría y resumen de llamadas de modelo.
