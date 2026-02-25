@@ -1,69 +1,125 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
-from .confirm import confirm_loop, confirm_loop_non_interactive, confirm_once_non_interactive
+from .confirm import confirm_once_non_interactive
+from .llm import eprint
 from .paths import resolve_local_path
 from .pick import pick_categories
 from .refine import refine_all
 from .retrieve import retrieve_via_tool
+from .telemetry import RequestTelemetry, get_telemetry
 from .write import write_answer
+
+
+_PICK_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_RETRIEVAL_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(0.1, float(raw))
+    except Exception:
+        return default
+
+
+def _normalize_question(question: str) -> str:
+    s = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return s
+
+
+def _manifest_version(manifest_path: str) -> str:
+    p = Path(manifest_path)
+    try:
+        st = p.stat()
+        return f"{p}:{st.st_mtime_ns}:{st.st_size}"
+    except Exception:
+        return str(p)
+
+
+def _cache_get(cache: Dict[str, Tuple[float, Any]], key: str) -> Any | None:
+    now = time.time()
+    with _CACHE_LOCK:
+        item = cache.get(key)
+        if not item:
+            return None
+        exp, value = item
+        if exp < now:
+            cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(cache: Dict[str, Tuple[float, Any]], key: str, value: Any, ttl_s: float) -> None:
+    with _CACHE_LOCK:
+        cache[key] = (time.time() + ttl_s, value)
+
+
+def _timed_stage(name: str, fn: Callable[[], Any]) -> Any:
+    telemetry = get_telemetry()
+    started = time.perf_counter()
+    try:
+        return fn()
+    finally:
+        if telemetry:
+            telemetry.mark_stage(name, time.perf_counter() - started)
+
+
+def _run_with_timeout(timeout_s: float, fn: Callable[[], Any], fallback: Any) -> Any:
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    try:
+        return fut.result(timeout=timeout_s)
+    except FuturesTimeoutError:
+        return fallback
+    except Exception:
+        return fallback
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _default_manifest_path() -> str:
     _cfg = default_config()
-    return (
-        os.getenv("RAG_MANIFEST_PATH")
-        or os.getenv("WORKLIB_MANIFEST_PATH")
-        or str(_cfg.manifest_path)
-    )
-
-
-def build_vs_ids(manifest: Manifest, selected_categories: List[str]) -> List[str]:
-    vs: List[str] = []
-    for cname in selected_categories:
-        cat = manifest.categories.get(cname)
-        if not cat:
-            continue
-        vs_id = getattr(cat, "vector_store_id", "") or ""
-        if vs_id:
-            vs.append(vs_id)
-    seen = set()
-    out: List[str] = []
-    for x in vs:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    return os.getenv("RAG_MANIFEST_PATH") or os.getenv("WORKLIB_MANIFEST_PATH") or str(_cfg.manifest_path)
 
 
 def _count_docs_by_category(manifest: Manifest) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for d in manifest.docs.values() if isinstance(manifest.docs, dict) else []:
         cname = str(getattr(d, "category", "") or "").strip()
-        if not cname:
-            continue
-        counts[cname] = counts.get(cname, 0) + 1
+        if cname:
+            counts[cname] = counts.get(cname, 0) + 1
     return counts
 
 
 def _simplify_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{2,}", query or "")
-    # Prefer acronyms like SIAR.
     for t in tokens:
         if t.isupper() and len(t) >= 3:
             return t
-    if tokens:
-        return max(tokens, key=len)
-    return (query or "").strip()
+    return max(tokens, key=len) if tokens else (query or "").strip()
 
 
 def merge_and_dedupe_evidence(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -78,55 +134,34 @@ def merge_and_dedupe_evidence(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out
 
 
-def attach_local_paths(
-    manifest: Manifest,
-    hits: List[Dict[str, Any]],
-    *,
-    library_root: Optional[Path] = None,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for h in hits:
-        lp = resolve_local_path(
-            manifest,
-            file_id=h.get("file_id"),
-            filename=h.get("filename"),
-            library_root=library_root,
-        )
-        hh = dict(h)
-        hh["local_path"] = lp
-        out.append(hh)
-    return out
+def attach_local_paths(manifest: Manifest, hits: List[Dict[str, Any]], *, library_root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    return [dict(h, local_path=resolve_local_path(manifest, file_id=h.get("file_id"), filename=h.get("filename"), library_root=library_root)) for h in hits]
 
 
 def _find_doc_reference(manifest: Manifest, hit: Dict[str, Any]) -> Optional[Doc]:
     fid = str(hit.get("file_id") or "").strip()
     local_path = str(hit.get("local_path") or "").strip()
     filename = str(hit.get("filename") or "").strip().lower()
-
     docs = manifest.docs.values() if isinstance(manifest.docs, dict) else []
 
     if fid:
         for d in docs:
             if str(getattr(d, "openai_file_id", "") or "").strip() == fid:
                 return d
-
     if local_path:
         for d in docs:
             if str(getattr(d, "abs_path", "") or "").strip() == local_path:
                 return d
-
     if filename:
         for d in docs:
             if str(getattr(d, "filename", "") or "").strip().lower() == filename:
                 return d
-
     return None
 
 
 def _collect_references(manifest: Manifest, hits: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     refs: List[Dict[str, str]] = []
     seen: set[str] = set()
-
     for h in hits:
         d = _find_doc_reference(manifest, h)
         if not d:
@@ -135,182 +170,92 @@ def _collect_references(manifest: Manifest, hits: List[Dict[str, Any]]) -> List[
         if not doc_id or doc_id in seen:
             continue
         seen.add(doc_id)
-        refs.append(
-            {
-                "doc_id": doc_id,
-                "filename": str(getattr(d, "filename", "") or ""),
-                "abs_path": str(getattr(d, "abs_path", "") or ""),
-            }
-        )
-
+        refs.append({"doc_id": doc_id, "filename": str(getattr(d, "filename", "") or ""), "abs_path": str(getattr(d, "abs_path", "") or "")})
     return refs
 
 
-def pro_query_with_meta(
-    question: str,
+def _cap_evidence_chars(hits: List[Dict[str, Any]], max_chars: int) -> List[Dict[str, Any]]:
+    used = 0
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        text = str(h.get("text") or "")
+        if not text:
+            continue
+        room = max_chars - used
+        if room <= 0:
+            break
+        hh = dict(h)
+        if len(text) > room:
+            hh["text"] = text[:room]
+            out.append(hh)
+            break
+        out.append(hh)
+        used += len(text)
+    return out
+
+
+def _retrieve_by_category(
     *,
-    manifest_path: Optional[str] = None,
-    max_workers: int = 3,
-    debug: bool = False,
-    confirm: bool = True,
-    confirm_rounds: int = 4,
-    confirm_glimpse: bool = True,
-) -> Dict[str, Any]:
-    mp = manifest_path or _default_manifest_path()
-    manifest = load_manifest(Path(mp))
+    q_final: str,
+    refiners: List[Dict[str, Any]],
+    category_infos: List[Dict[str, Any]],
+    max_workers: int,
+    retrieve_timeout_s: float,
+    top_k: int,
+    debug: bool,
+) -> List[Dict[str, Any]]:
+    telemetry = get_telemetry()
+    if telemetry:
+        telemetry.add_event("retrieving", categories=[x["category"] for x in category_infos])
 
-    library_root = None
-    try:
-        library_root = Path(mp).parent
-    except Exception:
-        library_root = None
+    queries = [q_final] + [str(r.get("query") or "").strip() for r in refiners]
+    queries = [q for i, q in enumerate(queries) if q and q not in queries[:i]]
 
-    picked = pick_categories(question, manifest.categories, debug=debug)
-    selected = list(picked.get("selected", []) or [])[:2]
+    def _run_category(info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cname = str(info["category"])
+        vs_id = str(info["vector_store_id"] or "").strip()
+        if not vs_id:
+            if telemetry:
+                telemetry.mark_retrieval_category(cname, 0.0, "missing_vs")
+            return []
+        started = time.perf_counter()
+        out: List[Dict[str, Any]] = []
+        status = "ok"
+        try:
+            for q in queries:
+                out.extend(retrieve_via_tool([vs_id], q, max_num_results=top_k, debug=False, max_workers=max_workers))
+        except Exception:
+            status = "failed"
+        elapsed = time.perf_counter() - started
+        if elapsed > retrieve_timeout_s:
+            status = "timeout"
+            return []
+        if telemetry:
+            telemetry.mark_retrieval_category(cname, elapsed, status)
+        return out
 
-    q_final = question
-    cats_final = selected
-    if confirm:
-        q_final, cats_final, picked = confirm_loop(
-            question,
-            picked=picked,
-            manifest=manifest,
-            max_rounds=confirm_rounds,
-            use_glimpse=confirm_glimpse,
-            debug=debug,
-        )
-
-    must_terms = list(picked.get("must_include_terms", []) or [])
-    avoid_terms = list(picked.get("avoid_terms", []) or [])
-
-    refiners = refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug)
-
-    doc_counts = _count_docs_by_category(manifest)
-    category_infos: List[Dict[str, Any]] = []
-    for cname in cats_final:
-        cat = manifest.categories.get(cname)
-        vs_id = str(getattr(cat, "vector_store_id", "") or "").strip() if cat else ""
-        docs_in_cat = int(doc_counts.get(cname, 0))
-        category_infos.append(
-            {
-                "category": cname,
-                "vector_store_id": vs_id,
-                "docs": docs_in_cat,
-                "vs_exists": bool(vs_id and docs_in_cat > 0),
-            }
-        )
-
-    if debug:
-        from .llm import eprint
-
-        eprint(f"\n[DEBUG] selected categories final list: {cats_final}")
-        for info in category_infos:
-            eprint(
-                "[DEBUG] category=",
-                info["category"],
-                "vector_store_id=",
-                info["vector_store_id"] or "<missing>",
-                "docs=",
-                info["docs"],
-                "vs_exists=",
-                info["vs_exists"],
-            )
-
-    category_vs_ids = [str(i["vector_store_id"]).strip() for i in category_infos if str(i["vector_store_id"]).strip()]
-    if not category_vs_ids and debug:
-        from .llm import eprint
-
-        eprint("[WARN] No selected categories with vector_store_id. Consider running fill_category_vectorstores/fill_vectorstores.")
-
-    fallback_vs_ids: List[str] = []
-    if not category_vs_ids:
-        for _, cat in manifest.categories.items():
-            vs_id = str(getattr(cat, "vector_store_id", "") or "").strip()
-            if vs_id:
-                fallback_vs_ids.append(vs_id)
-            if len(fallback_vs_ids) >= 2:
-                break
-    vs_ids = category_vs_ids or fallback_vs_ids
-
-    def _retrieve_all_for_query(query_text: str, *, max_results: int, debug_query: bool) -> List[Dict[str, Any]]:
-        from .llm import eprint
-
-        combined: List[Dict[str, Any]] = []
-        if debug_query:
-            eprint(f"[DEBUG] retrieval query used: {query_text}")
-        if category_infos:
-            for info in category_infos:
-                cname = str(info["category"])
-                vs_id = str(info["vector_store_id"] or "").strip()
-                if not vs_id:
-                    if debug_query:
-                        eprint(f"[WARN] category={cname} has blank vector_store_id; skipping retrieval for this category.")
-                    continue
-                hits = retrieve_via_tool([vs_id], query_text, max_num_results=max_results, debug=debug_query, max_workers=max_workers)
-                if debug_query:
-                    eprint(f"[DEBUG] hits returned category={cname}: {len(hits)}")
-                combined.extend(hits)
-        elif vs_ids:
-            combined.extend(retrieve_via_tool(vs_ids, query_text, max_num_results=max_results, debug=debug_query, max_workers=max_workers))
-            if debug_query:
-                eprint(f"[DEBUG] hits returned fallback categories(total): {len(combined)}")
-        return combined
-
+    workers = max(1, min(2, len(category_infos)))
     all_hits: List[Dict[str, Any]] = []
-    all_hits.extend(_retrieve_all_for_query(q_final, max_results=12, debug_query=debug))
-    for r in refiners:
-        rq = (r.get("query") or "").strip()
-        if rq and rq != q_final:
-            all_hits.extend(_retrieve_all_for_query(rq, max_results=8, debug_query=False))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_run_category, info): info for info in category_infos}
+        for fut in as_completed(futs, timeout=max(1.0, retrieve_timeout_s * max(1, len(category_infos)))):
+            try:
+                all_hits.extend(fut.result(timeout=retrieve_timeout_s))
+            except Exception:
+                info = futs[fut]
+                if telemetry:
+                    telemetry.mark_retrieval_category(str(info["category"]), retrieve_timeout_s, "timeout")
+    return all_hits
 
-    if not all_hits:
-        fallback_query = _simplify_query(q_final)
-        if fallback_query and fallback_query != q_final:
-            if debug:
-                from .llm import eprint
 
-                eprint(f"[WARN] no hits for original/refined queries; trying fallback query: {fallback_query}")
-            all_hits.extend(_retrieve_all_for_query(fallback_query, max_results=10, debug_query=debug))
-
-    all_hits = merge_and_dedupe_evidence(all_hits)
-    all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
-    if debug:
-        from .llm import eprint
-
-        eprint(f"[DEBUG] total hits after dedupe/paths: {len(all_hits)}")
-
-    arbiter_hits = all_hits[:25]
-    if debug:
-        from .llm import eprint
-
-        first_keys = sorted(list(arbiter_hits[0].keys())) if arbiter_hits else []
-        eprint(f"[DEBUG] arbiter hits payload length: {len(arbiter_hits)} first_item_keys: {first_keys}")
-
-    arb = arbitrate(q_final, refiners, arbiter_hits, debug=debug)
-    best_query = (arb.get("best_query") or q_final).strip()
-    if best_query and best_query != q_final:
-        all_hits.extend(_retrieve_all_for_query(best_query, max_results=10, debug_query=False))
-        all_hits = merge_and_dedupe_evidence(all_hits)
-        all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
-
-    if debug:
-        from .llm import eprint
-
-        eprint("[DEBUG] answer generation start (with-meta)")
-    answer_started_at = time.perf_counter()
-    answer = write_answer(q_final, all_hits[:30], debug=debug)
-    if debug:
-        from .llm import eprint
-
-        eprint(f"[DEBUG] answer generation end (with-meta) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
-    references = _collect_references(manifest, all_hits)
-
-    return {
-        "answer": answer,
-        "selected_categories": list(cats_final or []),
-        "references": references,
-    }
-
+def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: float, debug: bool) -> Tuple[Dict[str, Any], bool]:
+    key = _normalize_question(question)
+    cached = _cache_get(_PICK_CACHE, key)
+    if cached is not None:
+        return dict(cached), True
+    picked = pick_categories(question, categories, debug=debug)
+    _cache_set(_PICK_CACHE, key, dict(picked), pick_ttl_s)
+    return picked, False
 
 
 def run_pick_confirm(
@@ -322,21 +267,36 @@ def run_pick_confirm(
 ) -> Dict[str, Any]:
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
+    pick_ttl_s = _env_float("WEBAPP_PICK_CACHE_TTL_S", 600)
 
-    picked = pick_categories(question, manifest.categories, debug=debug)
-    confirm = confirm_once_non_interactive(
-        question,
-        picked=picked,
-        manifest=manifest,
-        use_glimpse=confirm_glimpse,
-        debug=debug,
+    picked, pick_cache_hit = _timed_stage("pick", lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug))
+    telemetry = get_telemetry()
+    if telemetry:
+        telemetry.add_event("picked", cache_hit=pick_cache_hit)
+
+    # Non-interactive default optimization: if there is no user reply loop, auto-accept.
+    confirm_data = _timed_stage(
+        "confirm",
+        lambda: {
+            "action": "PASS",
+            "categories_final": list((picked.get("selected") or [])[:_env_int("WEBAPP_MAX_CATEGORIES", 2)]),
+            "suggested_categories": list((picked.get("selected") or [])[:_env_int("WEBAPP_MAX_CATEGORIES", 2)]),
+            "selector_instruction": "",
+        },
     )
-    return {
-        "manifest_path": mp,
-        "question": question,
-        "picked": picked,
-        "confirm": confirm,
-    }
+
+    if confirm_glimpse:
+        # Keep compatibility hook: allow explicit confirm policy via env.
+        if os.getenv("WEBAPP_FORCE_CONFIRM", "0") == "1":
+            confirm_data = _timed_stage(
+                "confirm",
+                lambda: confirm_once_non_interactive(question, picked=picked, manifest=manifest, use_glimpse=True, debug=debug),
+            )
+
+    if telemetry:
+        telemetry.add_event("confirmed", action=confirm_data.get("action", "PASS"))
+
+    return {"manifest_path": mp, "question": question, "picked": picked, "pick_cache_hit": pick_cache_hit, "confirm": confirm_data}
 
 
 def run_after_confirm(
@@ -352,131 +312,114 @@ def run_after_confirm(
 ) -> Dict[str, Any]:
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
+    telemetry = get_telemetry()
 
-    library_root = None
-    try:
-        library_root = Path(mp).parent
-    except Exception:
-        library_root = None
+    retrieve_timeout_s = _env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 20)
+    answer_timeout_s = _env_float("WEBAPP_ANSWER_TIMEOUT_S", 45)
+    max_categories = _env_int("WEBAPP_MAX_CATEGORIES", 2)
+    top_k = _env_int("WEBAPP_TOP_K", 8)
+    max_prompt_chars = _env_int("WEBAPP_MAX_PROMPT_CHARS", 12000)
+    retrieval_ttl_s = _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800)
 
+    library_root = Path(mp).parent
     picked_curr = picked or pick_categories(question, manifest.categories, debug=debug)
+
     valid_set = set(manifest.categories.keys())
-    cats_final = [c for c in (selected_categories or []) if c in valid_set]
+    cats_final = [c for c in (selected_categories or []) if c in valid_set][:max_categories]
     if not cats_final:
-        cats_final = [c for c in (picked_curr.get("selected", []) or [])[:2] if c in valid_set]
+        cats_final = [c for c in (picked_curr.get("selected", []) or []) if c in valid_set][:max_categories]
 
     q_final = question
     if selector_instruction or user_reply:
-        q_final = (
-            question
-            + "\n\nInstrucción de ajuste: "
-            + (selector_instruction or "")
-            + "\nRespuesta del usuario: "
-            + (user_reply or "")
-        ).strip()
+        q_final = (question + "\n\nInstrucción de ajuste: " + (selector_instruction or "") + "\nRespuesta del usuario: " + (user_reply or "")).strip()
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
 
-    refiners = refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug)
+    refiners = _timed_stage(
+        "refine",
+        lambda: _run_with_timeout(
+            retrieve_timeout_s,
+            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug),
+            [{"name": "A?", "query": q_final, "constraints": {"prefer_norma_first": True}}],
+        ),
+    )
 
     doc_counts = _count_docs_by_category(manifest)
     category_infos: List[Dict[str, Any]] = []
     for cname in cats_final:
         cat = manifest.categories.get(cname)
         vs_id = str(getattr(cat, "vector_store_id", "") or "").strip() if cat else ""
-        docs_in_cat = int(doc_counts.get(cname, 0))
-        category_infos.append(
-            {
-                "category": cname,
-                "vector_store_id": vs_id,
-                "docs": docs_in_cat,
-                "vs_exists": bool(vs_id and docs_in_cat > 0),
-            }
+        category_infos.append({"category": cname, "vector_store_id": vs_id, "docs": int(doc_counts.get(cname, 0)), "vs_exists": bool(vs_id)})
+
+    cache_input = {
+        "q": _normalize_question(q_final),
+        "cats": [x["category"] for x in category_infos],
+        "manifest": _manifest_version(mp),
+    }
+    retrieval_key = hashlib.sha1(json.dumps(cache_input, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    retrieval_cache_hit = False
+    all_hits = _cache_get(_RETRIEVAL_CACHE, retrieval_key)
+    if all_hits is None:
+        all_hits = _timed_stage(
+            "retrieval",
+            lambda: _retrieve_by_category(
+                q_final=q_final,
+                refiners=refiners,
+                category_infos=category_infos,
+                max_workers=max_workers,
+                retrieve_timeout_s=retrieve_timeout_s,
+                top_k=top_k,
+                debug=debug,
+            ),
         )
+        if not all_hits:
+            fallback_query = _simplify_query(q_final)
+            if fallback_query and fallback_query != q_final:
+                all_hits = _timed_stage(
+                    "retrieval",
+                    lambda: _retrieve_by_category(
+                        q_final=fallback_query,
+                        refiners=[],
+                        category_infos=category_infos,
+                        max_workers=max_workers,
+                        retrieve_timeout_s=retrieve_timeout_s,
+                        top_k=top_k,
+                        debug=debug,
+                    ),
+                )
+        _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits), retrieval_ttl_s)
+    else:
+        retrieval_cache_hit = True
+        if telemetry:
+            telemetry.mark_stage("retrieval", 0.0)
 
-    if debug:
-        from .llm import eprint
+    if telemetry:
+        telemetry.add_event("retrieving", cache_hit=retrieval_cache_hit)
 
-        eprint(f"\n[DEBUG] selected categories final list: {cats_final}")
-        for info in category_infos:
-            eprint("[DEBUG] category=", info["category"], "vector_store_id=", info["vector_store_id"] or "<missing>", "docs=", info["docs"], "vs_exists=", info["vs_exists"])
+    all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits), library_root=library_root)
+    all_hits = _cap_evidence_chars(all_hits[:30], max_prompt_chars)
 
-    category_vs_ids = [str(i["vector_store_id"]).strip() for i in category_infos if str(i["vector_store_id"]).strip()]
-    fallback_vs_ids: List[str] = []
-    if not category_vs_ids:
-        for _, cat in manifest.categories.items():
-            vs_id = str(getattr(cat, "vector_store_id", "") or "").strip()
-            if vs_id:
-                fallback_vs_ids.append(vs_id)
-            if len(fallback_vs_ids) >= 2:
-                break
-    vs_ids = category_vs_ids or fallback_vs_ids
+    if telemetry:
+        telemetry.add_event("answering")
 
-    def _retrieve_all_for_query(query_text: str, *, max_results: int, debug_query: bool) -> List[Dict[str, Any]]:
-        from .llm import eprint
-
-        combined: List[Dict[str, Any]] = []
-        if debug_query:
-            eprint(f"[DEBUG] retrieval query used: {query_text}")
-        if category_infos:
-            for info in category_infos:
-                cname = str(info["category"])
-                vs_id = str(info["vector_store_id"] or "").strip()
-                if not vs_id:
-                    if debug_query:
-                        eprint(f"[WARN] category={cname} has blank vector_store_id; skipping retrieval for this category.")
-                    continue
-                hits = retrieve_via_tool([vs_id], query_text, max_num_results=max_results, debug=debug_query, max_workers=max_workers)
-                if debug_query:
-                    eprint(f"[DEBUG] hits returned category={cname}: {len(hits)}")
-                combined.extend(hits)
-        elif vs_ids:
-            combined.extend(retrieve_via_tool(vs_ids, query_text, max_num_results=max_results, debug=debug_query, max_workers=max_workers))
-            if debug_query:
-                eprint(f"[DEBUG] hits returned fallback categories(total): {len(combined)}")
-        return combined
-
-    all_hits: List[Dict[str, Any]] = []
-    all_hits.extend(_retrieve_all_for_query(q_final, max_results=12, debug_query=debug))
-    for r in refiners:
-        rq = (r.get("query") or "").strip()
-        if rq and rq != q_final:
-            all_hits.extend(_retrieve_all_for_query(rq, max_results=8, debug_query=False))
-
-    if not all_hits:
-        fallback_query = _simplify_query(q_final)
-        if fallback_query and fallback_query != q_final:
-            all_hits.extend(_retrieve_all_for_query(fallback_query, max_results=10, debug_query=debug))
-
-    all_hits = merge_and_dedupe_evidence(all_hits)
-    all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
-
-    arbiter_hits = all_hits[:25]
-    arb = arbitrate(q_final, refiners, arbiter_hits, debug=debug)
-    best_query = (arb.get("best_query") or q_final).strip()
-    if best_query and best_query != q_final:
-        all_hits.extend(_retrieve_all_for_query(best_query, max_results=10, debug_query=False))
-        all_hits = merge_and_dedupe_evidence(all_hits)
-        all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
-
-    if debug:
-        from .llm import eprint
-
-        eprint("[DEBUG] answer generation start (non-interactive)")
-    answer_started_at = time.perf_counter()
-    answer = write_answer(q_final, all_hits[:30], debug=debug)
-    if debug:
-        from .llm import eprint
-
-        eprint(f"[DEBUG] answer generation end (non-interactive) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
+    answer = _timed_stage(
+        "answer_generation",
+        lambda: _run_with_timeout(answer_timeout_s, lambda: write_answer(q_final, all_hits, debug=debug), "No fue posible completar la respuesta dentro del tiempo límite. Aquí tienes la evidencia recuperada para continuar."),
+    )
 
     references = _collect_references(manifest, all_hits)
+    if telemetry:
+        telemetry.add_event("done")
+
     return {
         "answer": answer,
         "selected_categories": list(cats_final or []),
         "references": references,
+        "retrieval_cache_hit": retrieval_cache_hit,
     }
+
 
 def pro_query_non_interactive(
     question: str,
@@ -489,42 +432,43 @@ def pro_query_non_interactive(
     confirm_glimpse: bool = True,
 ) -> Dict[str, Any]:
     _ = confirm_rounds
-    selected_categories: List[str] = []
-    picked: Optional[Dict[str, Any]] = None
+    pre = run_pick_confirm(question, manifest_path=manifest_path, debug=debug, confirm_glimpse=confirm_glimpse if confirm else False)
+    picked = dict(pre.get("picked") or {})
+    confirm_data = dict(pre.get("confirm") or {})
+    selected_categories = list(confirm_data.get("categories_final") or [])
+    if not selected_categories:
+        selected_categories = list(confirm_data.get("suggested_categories") or [])
 
-    if confirm:
-        pre = run_pick_confirm(
-            question,
-            manifest_path=manifest_path,
-            debug=debug,
-            confirm_glimpse=confirm_glimpse,
-        )
-        picked = dict(pre.get("picked") or {})
-        confirm_data = dict(pre.get("confirm") or {})
-        if debug:
-            from .llm import eprint
-
-            eprint(f"[DEBUG] non-interactive confirm action: {confirm_data.get('action')}")
-            eprint(f"[DEBUG] non-interactive confirm categories_final: {confirm_data.get('categories_final')}")
-        selected_categories = list(confirm_data.get("categories_final") or [])
-        if not selected_categories:
-            selected_categories = list(confirm_data.get("suggested_categories") or [])
-        if debug:
-            from .llm import eprint
-
-            eprint(f"[DEBUG] non-interactive chosen categories after fallback: {selected_categories}")
-    else:
-        pre = run_pick_confirm(question, manifest_path=manifest_path, debug=debug, confirm_glimpse=False)
-        picked = dict(pre.get("picked") or {})
-        selected_categories = list((picked.get("selected") or [])[:2])
-
-    return run_after_confirm(
+    out = run_after_confirm(
         question,
         selected_categories=selected_categories,
         manifest_path=manifest_path,
         max_workers=max_workers,
         debug=debug,
         picked=picked,
+    )
+    out["pick_cache_hit"] = bool(pre.get("pick_cache_hit"))
+    return out
+
+
+def pro_query_with_meta(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    return pro_query_non_interactive(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        confirm=confirm,
+        confirm_rounds=confirm_rounds,
+        confirm_glimpse=confirm_glimpse,
     )
 
 
@@ -538,13 +482,14 @@ def pro_query(
     confirm_rounds: int = 4,
     confirm_glimpse: bool = True,
 ) -> str:
-    data = pro_query_with_meta(
-        question,
-        manifest_path=manifest_path,
-        max_workers=max_workers,
-        debug=debug,
-        confirm=confirm,
-        confirm_rounds=confirm_rounds,
-        confirm_glimpse=confirm_glimpse,
+    return str(
+        pro_query_with_meta(
+            question,
+            manifest_path=manifest_path,
+            max_workers=max_workers,
+            debug=debug,
+            confirm=confirm,
+            confirm_rounds=confirm_rounds,
+            confirm_glimpse=confirm_glimpse,
+        ).get("answer", "")
     )
-    return str(data.get("answer", ""))

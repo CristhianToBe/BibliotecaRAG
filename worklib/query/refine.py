@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
 from worklib.prompt_loader import load_prompt
-from .llm import call_text, eprint, MODEL_FAST
+from .llm import call_text, eprint, MODEL_REFINE
 
 SYSTEM_REFINER_A1 = load_prompt("query_refiner_a1_system")
 SYSTEM_REFINER_A2 = load_prompt("query_refiner_a2_system")
@@ -13,7 +13,7 @@ SYSTEM_REFINER_A3 = load_prompt("query_refiner_a3_system")
 
 
 def refine_one(system_prompt: str, base_context: Dict[str, Any], *, debug: bool = False) -> Dict[str, Any]:
-    resp = call_text(MODEL_FAST, system_prompt, json.dumps(base_context, ensure_ascii=False), debug=debug)
+    resp = call_text(MODEL_REFINE, system_prompt, json.dumps(base_context, ensure_ascii=False), debug=debug)
     txt = resp.output_text or ""
     if debug:
         eprint("\n[DEBUG] refiner raw output_text:")

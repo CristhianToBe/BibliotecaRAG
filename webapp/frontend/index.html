@@ -87,11 +87,13 @@
               </div>
             </div>
           </div>
+
+          <div class="small" v-if="loadingChat">Etapa actual: {{ currentStageLabel }}</div>
           <div class="row">
             <textarea v-model="question" rows="3" :placeholder="inputPlaceholder"></textarea>
           </div>
           <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">
-            {{ loadingChat ? 'Consultando...' : 'Enviar pregunta' }}
+            {{ loadingChat ? `Consultando... ${currentStageLabel}` : 'Enviar pregunta' }}
           </button>
         </section>
 
@@ -133,6 +135,8 @@
             debugMode: false,
             pendingConfirm: null,
             originalQuestion: "",
+            currentStageLabel: "iniciando",
+            stageTicker: null,
           };
         },
         computed: {
@@ -186,11 +190,23 @@
                 console.log('[Debug] request payload', payload);
               }
 
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 95000);
+              const stageSteps = ["pick", "confirm", "retrieving", "answering"];
+              let idx = 0;
+              this.currentStageLabel = stageSteps[idx];
+              this.stageTicker = setInterval(() => {
+                idx = Math.min(stageSteps.length - 1, idx + 1);
+                this.currentStageLabel = stageSteps[idx];
+              }, 6000);
+
               const r = await fetch(`${API_BASE}/api/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
+                signal: controller.signal,
               });
+              clearTimeout(timeoutId);
               const data = await r.json();
               if (this.debugMode) {
                 console.log('[Debug] raw response JSON', data);
@@ -198,6 +214,7 @@
               if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
 
               if (data.status === 'needs_user') {
+                this.currentStageLabel = "needs user";
                 this.pendingConfirm = {
                   conversation_id: data.conversation_id,
                   selector_instruction: data.selector_instruction || '',
@@ -209,6 +226,7 @@
                   references: [],
                 });
               } else {
+                this.currentStageLabel = "done";
                 this.pendingConfirm = null;
                 this.messages.push({
                   role: "bot",
@@ -223,10 +241,12 @@
               if (this.debugMode) {
                 console.error('[Debug] errors', e);
               }
-              this.messages.push({ role: "bot", text: `Error: ${e.message}`, references: [] });
+              const friendly = (e && e.name === "AbortError") ? "La consulta tardó demasiado. Intenta una pregunta más concreta." : e.message;
+              this.messages.push({ role: "bot", text: `Error: ${friendly}`, references: [] });
               this.scrollChatToBottom();
             } finally {
               this.loadingChat = false;
+              if (this.stageTicker) { clearInterval(this.stageTicker); this.stageTicker = null; }
             }
           },
           onFile(event) {
@@ -264,6 +284,7 @@
                 this.uploadStatus = `OK (${detail.status || 'ingested'}) · categoría=${detail.category || '-'} · doc_id=${detail.doc_id || '-'}`;
                 this.uploadProgress = 100;
               } else {
+                this.currentStageLabel = "done";
                 this.uploadOk = false;
                 this.uploadStatus = `Error: ${this.extractError(data, 'Error en upload')}`;
               }

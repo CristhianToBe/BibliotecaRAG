@@ -11,8 +11,9 @@ from dotenv import load_dotenv
 from openai import APITimeoutError, APIConnectionError, RateLimitError
 
 from worklib.openai_client import get_client
-from worklib.settings import get_openai_settings
 from worklib.prompt_loader import load_prompt
+from worklib.settings import get_openai_settings
+from .telemetry import get_telemetry
 
 load_dotenv()
 
@@ -22,7 +23,12 @@ _settings = get_openai_settings()
 MODEL_FAST = _settings.query_model_fast
 MODEL_SMART = _settings.query_model_smart
 
-MODEL_CONFIRM = os.getenv("RAG_MODEL_CONFIRM") or os.getenv("CONFIRM_MODEL") or "gpt-5-nano"
+MODEL_PICK = os.getenv("MODEL_PICK", "gpt-5-nano")
+MODEL_CONFIRM = os.getenv("MODEL_CONFIRM", "gpt-5-nano")
+MODEL_REFINE = os.getenv("MODEL_REFINE", "gpt-5-nano")
+MODEL_ANSWER = os.getenv("MODEL_ANSWER", "gpt-5-mini")
+MODEL_ARBITRATE = os.getenv("MODEL_ARBITRATE", MODEL_ANSWER)
+
 SYSTEM_CONFIRM = load_prompt("confirm_system")
 
 
@@ -62,6 +68,10 @@ def call_text(
     include=None,
     debug: bool = False,
 ) -> Any:
+    telemetry = get_telemetry()
+    if telemetry is not None:
+        telemetry.note_model_call(model)
+
     kwargs: Dict[str, Any] = dict(
         model=model,
         input=[
