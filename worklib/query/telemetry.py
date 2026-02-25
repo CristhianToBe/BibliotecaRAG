@@ -65,3 +65,30 @@ def reset_telemetry(token: contextvars.Token[RequestTelemetry | None]) -> None:
 
 def get_telemetry() -> RequestTelemetry | None:
     return _current_telemetry.get()
+
+_current_stage: contextvars.ContextVar[str] = contextvars.ContextVar("query_stage", default="")
+_debug_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("query_debug_enabled", default=False)
+
+
+def set_current_stage(stage_name: str) -> contextvars.Token[str]:
+    return _current_stage.set(stage_name or "")
+
+
+def reset_current_stage(token: contextvars.Token[str]) -> None:
+    _current_stage.reset(token)
+
+
+def get_current_stage() -> str:
+    return _current_stage.get()
+
+
+def set_debug_enabled(enabled: bool) -> contextvars.Token[bool]:
+    return _debug_enabled.set(bool(enabled))
+
+
+def reset_debug_enabled(token: contextvars.Token[bool]) -> None:
+    _debug_enabled.reset(token)
+
+
+def is_debug_enabled() -> bool:
+    return bool(_debug_enabled.get())

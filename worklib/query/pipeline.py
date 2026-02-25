@@ -21,7 +21,7 @@ from .paths import resolve_local_path
 from .pick import pick_categories
 from .refine import refine_all
 from .retrieve import retrieve_via_tool
-from .telemetry import RequestTelemetry, get_telemetry
+from .telemetry import RequestTelemetry, get_current_stage, get_telemetry, reset_current_stage, reset_debug_enabled, set_current_stage, set_debug_enabled, set_telemetry
 from .write import write_answer
 
 
@@ -34,8 +34,9 @@ _CACHE_LOCK = threading.Lock()
 class PipelineTimeouts:
     total_s: float = 120.0
     pick_s: float = 10.0
-    confirm_s: float = 10.0
-    refine_s: float = 10.0
+    # temporary to reduce false timeouts during debugging; adjust later
+    confirm_s: float = 20.0
+    refine_s: float = 20.0
     retrieve_per_cat_s: float = 15.0
     write_s: float = 45.0
 
@@ -50,6 +51,9 @@ class PipelineOptions:
     max_context_chars: int = 12000
     timeouts: PipelineTimeouts = field(default_factory=PipelineTimeouts)
 
+
+TIMEOUT_GRACE_MS = 250
+LATE_RESULT_GRACE_S = 2.0
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, str(default))
@@ -251,7 +255,10 @@ def _retrieve_by_category(
     def _run_category(info: Dict[str, Any]) -> List[Dict[str, Any]]:
         cname = str(info["category"])
         vs_id = str(info["vector_store_id"] or "").strip()
+        trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
         if not vs_id:
+            if debug:
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": 0.0, "hits_count": 0, "reason": "missing_vs"})
             if telemetry:
                 telemetry.mark_retrieval_category(cname, 0.0, "missing_vs")
             return []
@@ -260,13 +267,25 @@ def _retrieve_by_category(
         status = "ok"
         try:
             for q in queries:
+                if debug:
+                    print("[DEBUG] RETRIEVAL_CAT_BEGIN", {
+                        "trace_id": trace_id,
+                        "category": cname,
+                        "vector_store_id": vs_id,
+                        "budget_s": retrieve_timeout_s,
+                        "query": q,
+                    })
                 out.extend(retrieve_via_tool([vs_id], q, max_num_results=top_k, debug=False, max_workers=max_workers))
         except Exception:
             status = "failed"
         elapsed = time.perf_counter() - started
         if elapsed > retrieve_timeout_s:
             status = "timeout"
+            if debug:
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": "timeout"})
             return []
+        if debug:
+            print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": status})
         if telemetry:
             telemetry.mark_retrieval_category(cname, elapsed, status)
         return out
@@ -387,11 +406,31 @@ def run_pipeline_resilient(
         debug_pipeline["stages"][stage_name] = payload
         _debug_log("STAGE_END", payload)
 
-    def _run_stage_with_timeout(stage_name: str, budget_s: float, fn: Callable[[], Any], fallback: Any) -> Tuple[Any, bool, float, int]:
+    def _run_stage_with_timeout(
+        stage_name: str,
+        budget_s: float,
+        fn: Callable[[], Any],
+        fallback: Any,
+        *,
+        timeout_grace_ms: int = 0,
+        allow_debug_late_output: bool = False,
+    ) -> Tuple[Any, bool, float, int, str]:
         s0 = _stage_begin(stage_name, stage_budget_s=budget_s)
         calls_before = telemetry.model_calls if telemetry else 0
+
+        def _thread_fn() -> Any:
+            tele_token = set_telemetry(telemetry)
+            stage_token = set_current_stage(stage_name)
+            debug_token = set_debug_enabled(debug)
+            try:
+                return fn()
+            finally:
+                reset_debug_enabled(debug_token)
+                reset_current_stage(stage_token)
+                reset_telemetry(tele_token)
+
         ex = ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(fn)
+        fut = ex.submit(_thread_fn)
         timeout_state = {"timed_out": False}
 
         if debug:
@@ -400,24 +439,55 @@ def run_pipeline_resilient(
                     _debug_log("STAGE_LATE_RESULT", {
                         "stage_name": stage_name,
                         "note": "received output after stage timed out",
-                        "output_disposition": "discarded_fallback_used",
                     })
             fut.add_done_callback(_on_done)
 
         timed_out = False
+        stage_result_used = "stage_output"
+        timeout_budget = max(0.1, budget_s + (timeout_grace_ms / 1000.0))
         try:
-            value = fut.result(timeout=budget_s)
+            value = fut.result(timeout=timeout_budget)
         except FuturesTimeoutError:
             timeout_state["timed_out"] = True
             timed_out = True
             value = fallback
+            stage_result_used = "fallback"
+            if debug and allow_debug_late_output:
+                try:
+                    late_value = fut.result(timeout=LATE_RESULT_GRACE_S)
+                    value = late_value
+                    timed_out = False
+                    stage_result_used = "late_output_used"
+                    warnings.append(f"Se usó salida tardía de {stage_name} en modo debug.")
+                    _debug_log("STAGE_LATE_RESULT_POLICY", {
+                        "stage_name": stage_name,
+                        "used": True,
+                        "reason": "late_output_within_debug_grace",
+                    })
+                except Exception:
+                    _debug_log("STAGE_LATE_RESULT_POLICY", {
+                        "stage_name": stage_name,
+                        "used": False,
+                        "reason": "late_output_not_available_within_grace",
+                    })
         except Exception as exc:
             value = fallback
+            stage_result_used = "fallback"
             _debug_log("STAGE_ERROR", {"stage_name": stage_name, "error": str(exc)})
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
         elapsed_s = max(0.0, time.perf_counter() - s0)
+        elapsed_ms = round(elapsed_s * 1000, 2)
+        budget_ms = round(budget_s * 1000, 2)
+        if timeout_grace_ms > 0 and (elapsed_ms > budget_ms) and (elapsed_ms <= budget_ms + timeout_grace_ms) and not timed_out:
+            _debug_log("TIMEOUT_GRACE_APPLIED", {
+                "stage_name": stage_name,
+                "budget_ms": budget_ms,
+                "elapsed_ms": elapsed_ms,
+                "grace_ms": timeout_grace_ms,
+            })
+
         if telemetry:
             telemetry.mark_stage(stage_name, elapsed_s)
         calls_after = telemetry.model_calls if telemetry else calls_before
@@ -428,11 +498,12 @@ def run_pipeline_resilient(
             timed_out=timed_out,
             reason="timeout" if timed_out else "ok",
             extra={
-                "timeout_policy": "future.result(timeout=budget_s)",
+                "timeout_policy": f"future.result(timeout=budget+grace={timeout_budget:.3f}s)",
                 "llm_calls_made": max(0, calls_after - calls_before),
+                "stage_result_used": stage_result_used,
             },
         )
-        return value, timed_out, elapsed_s, max(0, calls_after - calls_before)
+        return value, timed_out, elapsed_s, max(0, calls_after - calls_before), stage_result_used
 
     if not opts.use_picker and not manual_categories:
         out = {
@@ -483,7 +554,7 @@ def run_pipeline_resilient(
 
     if opts.use_picker:
         pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_s() - 2))
-        pick_result, pick_timed_out, _, _ = _run_stage_with_timeout(
+        pick_result, pick_timed_out, _, _, _ = _run_stage_with_timeout(
             "pick",
             pick_timeout,
             lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug),
@@ -538,18 +609,20 @@ def run_pipeline_resilient(
     confirm_data: Dict[str, Any] = {}
     if opts.use_confirmer and selected_categories:
         confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_s() - 2))
-        confirm_data, confirm_timed_out, confirm_elapsed_s, confirm_calls = _run_stage_with_timeout(
+        confirm_data, confirm_timed_out, confirm_elapsed_s, confirm_calls, confirm_result_used = _run_stage_with_timeout(
             "confirm",
             confirm_timeout,
             lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=True, debug=debug),
             {"categories_final": selected_categories, "suggested_categories": selected_categories, "_timeout": True},
+            timeout_grace_ms=TIMEOUT_GRACE_MS,
+            allow_debug_late_output=True,
         )
         _debug_log("CONFIRM_TIMEOUT_DIAGNOSTICS", {
             "confirm_budget_s": confirm_timeout,
             "confirm_elapsed_ms": round(confirm_elapsed_s * 1000, 2),
             "confirm_llm_calls": confirm_calls,
             "confirm_timeout_flag": bool(confirm_timed_out or confirm_data.get("_timeout")),
-            "confirm_used_output": "fallback" if (confirm_timed_out or confirm_data.get("_timeout")) else "stage_output",
+            "confirm_used_output": confirm_result_used,
         })
         if confirm_data.get("_timeout"):
             _degrade_once("timeout en confirmer")
@@ -570,11 +643,13 @@ def run_pipeline_resilient(
     refiners: List[Dict[str, Any]] = []
     if opts.use_refiner:
         refine_timeout = min(opts.timeouts.refine_s, max(1.0, _remaining_s() - 2))
-        refiners, refine_timed_out, refine_elapsed_s, refine_calls = _run_stage_with_timeout(
+        refiners, refine_timed_out, refine_elapsed_s, refine_calls, refine_result_used = _run_stage_with_timeout(
             "refine",
             refine_timeout,
             lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug),
             [],
+            timeout_grace_ms=TIMEOUT_GRACE_MS,
+            allow_debug_late_output=True,
         )
         _debug_log("REFINE_TIMEOUT_DIAGNOSTICS", {
             "refine_budget_s": refine_timeout,
@@ -583,6 +658,7 @@ def run_pipeline_resilient(
             "refiner_variants_returned": len(refiners or []),
             "refiner_variant_names": [str(r.get("name") or "") for r in (refiners or [])],
             "refine_timeout_flag": bool(refine_timed_out),
+            "refine_used_output": refine_result_used,
         })
         if not refiners:
             _degrade_once("timeout en refiner")
@@ -592,9 +668,13 @@ def run_pipeline_resilient(
             telemetry.mark_stage("refine", 0.0)
         _stage_end("refine", started_at=s, stage_budget_s=opts.timeouts.refine_s, skipped=True, reason="disabled")
 
+    refined_queries = [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()]
+    if refined_queries:
+        q_final = refined_queries[0]
+
     debug_pipeline["query_evolution"] = {
         "original_question": question,
-        "refined_queries": [str(r.get("query") or "") for r in refiners if str(r.get("query") or "").strip()],
+        "refined_queries": refined_queries,
         "final_query_for_retrieval": q_final,
         "selector_instruction": str(confirm_data.get("selector_instruction") or ""),
         "must_include_terms": must_terms,
@@ -632,7 +712,6 @@ def run_pipeline_resilient(
         retrieval_cache_hit = False
         all_hits = None
 
-    retrieval_stage_start = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s)
     if all_hits is None and _remaining_s() > 6:
         retrieve_timeout = min(opts.timeouts.retrieve_per_cat_s, max(1.0, _remaining_s() / max(1, len(category_infos))))
         _debug_log("RETRIEVAL_EXECUTED", {
@@ -642,32 +721,43 @@ def run_pipeline_resilient(
             "top_k": opts.top_k,
             "retrieve_timeout_s": retrieve_timeout,
         })
-        rt = time.perf_counter()
-        all_hits = _retrieve_by_category(
-            q_final=q_final,
-            refiners=refiners,
-            category_infos=category_infos,
-            max_workers=max_workers,
-            retrieve_timeout_s=retrieve_timeout,
-            top_k=opts.top_k,
-            debug=debug,
+        all_hits, retrieval_timed_out, retrieval_elapsed_s, _, retrieval_result_used = _run_stage_with_timeout(
+            "retrieval",
+            retrieve_timeout,
+            lambda: _retrieve_by_category(
+                q_final=q_final,
+                refiners=refiners,
+                category_infos=category_infos,
+                max_workers=max_workers,
+                retrieve_timeout_s=retrieve_timeout,
+                top_k=opts.top_k,
+                debug=debug,
+            ),
+            [],
         )
-        if telemetry:
-            telemetry.mark_stage("retrieval", max(0.0, time.perf_counter() - rt))
+        if retrieval_timed_out:
+            warnings.append("Retrieval timed out; se devolvió evidencia parcial o vacía.")
+            degrade_steps.append("Retrieval timed out")
+            _debug_log("RETRIEVAL_TIMEOUT_OBSERVED", {
+                "elapsed_ms": round(retrieval_elapsed_s * 1000, 2),
+                "budget_ms": round(retrieve_timeout * 1000, 2),
+                "stage_result_used": retrieval_result_used,
+            })
         _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits or []), _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800))
-        _stage_end("retrieval", started_at=retrieval_stage_start, stage_budget_s=opts.timeouts.retrieve_per_cat_s, reason="executed", extra={"hits_len": len(all_hits or [])})
     elif all_hits is None:
         all_hits = []
         _degrade_once("sin tiempo para retrieval")
         if telemetry:
             telemetry.mark_stage("retrieval", 0.0)
+        sret = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="insufficient_remaining_budget")
         _debug_log("RETRIEVAL_SKIPPED", {"reason": "insufficient_remaining_budget", "remaining_s": _remaining_s()})
-        _stage_end("retrieval", started_at=retrieval_stage_start, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, degraded=True, reason="insufficient_remaining_budget", extra={"hits_len": 0})
+        _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, degraded=True, reason="insufficient_remaining_budget", extra={"hits_len": 0})
     else:
         if telemetry:
             telemetry.mark_stage("retrieval", 0.0)
+        sret = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit")
         _debug_log("RETRIEVAL_SKIPPED", {"reason": "cache_hit", "cached_hits_count": len(all_hits or [])})
-        _stage_end("retrieval", started_at=retrieval_stage_start, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
+        _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
 
     all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits or []), library_root=Path(mp).parent)
     all_hits = _cap_evidence_chars((all_hits or [])[:30], opts.max_context_chars)
@@ -732,13 +822,13 @@ def run_pipeline_resilient(
         return out
 
     write_timeout = min(opts.timeouts.write_s, max(1.0, _remaining_s() - 1))
-    answer, writer_timed_out, _, _ = _run_stage_with_timeout(
+    answer, writer_timed_out, _, _, writer_result_used = _run_stage_with_timeout(
         "answer_generation",
         write_timeout,
         lambda: write_answer(q_final, all_hits, debug=debug),
         "",
     )
-    _debug_log("WRITER_STATUS", {"timed_out": writer_timed_out, "write_budget_s": write_timeout})
+    _debug_log("WRITER_STATUS", {"timed_out": writer_timed_out, "write_budget_s": write_timeout, "writer_result_used": writer_result_used})
 
     if debug:
         print("[DEBUG] run_pipeline_resilient answer", {
