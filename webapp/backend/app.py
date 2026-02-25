@@ -268,6 +268,7 @@ async def chat(request: Request):
             effective_use_picker = True
 
         raw_top_level_manual_categories = getattr(req, "manual_categories", None)
+        raw_pipeline_manual_categories = getattr(req.pipeline, "manual_categories", None) if req.pipeline is not None else None
         top_level_manual_categories = _normalize_manual_categories(raw_top_level_manual_categories)
         effective_manual_categories = top_level_manual_categories
 
@@ -275,8 +276,17 @@ async def chat(request: Request):
             print("[DEBUG] chat payload snapshot", {
                 "pipeline": req.pipeline.model_dump() if req.pipeline else None,
                 "manual_categories": raw_top_level_manual_categories,
+                "pipeline_manual_categories": raw_pipeline_manual_categories,
             })
-            print(f"[DEBUG] minimum_check effective_use_picker={effective_use_picker} manual_count={len(effective_manual_categories)}")
+            print(
+                "[DEBUG] minimum_check",
+                {
+                    "effective_use_picker": effective_use_picker,
+                    "effective_manual_categories": effective_manual_categories,
+                    "raw_top_level_manual_categories": raw_top_level_manual_categories,
+                    "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
+                },
+            )
 
         if (not req.continue_from) and (not effective_use_picker) and (len(effective_manual_categories) == 0):
             content = {
@@ -290,6 +300,7 @@ async def chat(request: Request):
                     "effective_manual_categories": effective_manual_categories,
                     "raw_pipeline": req.pipeline.model_dump() if req.pipeline else None,
                     "raw_top_level_manual_categories": raw_top_level_manual_categories,
+                    "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
                     "raw_top_level_use_picker": top_level_use_picker,
                 }
             return JSONResponse(status_code=400, content=content)
@@ -321,6 +332,20 @@ async def chat(request: Request):
             pipeline=pipeline_payload,
             manual_categories=payload.get("manual_categories"),
         )
+        if req.debug:
+            print("[DEBUG] /api/chat pipeline result", {
+                "result": result,
+                "answer": result.get("answer"),
+                "selected_categories": result.get("selected_categories"),
+                "warnings": result.get("warnings"),
+                "degrade_steps": result.get("degrade_steps"),
+                "references": result.get("references"),
+                "retrieval_cache_hit": result.get("retrieval_cache_hit"),
+                "effective_use_picker": effective_use_picker,
+                "effective_manual_categories": effective_manual_categories,
+                "raw_top_level_manual_categories": raw_top_level_manual_categories,
+                "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
+            })
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
         summary = telemetry.summary()
@@ -328,16 +353,23 @@ async def chat(request: Request):
         degrade_steps = list(result.get("degrade_steps", []) or [])
         _log_trace(summary, degrade_steps=degrade_steps, warnings=warnings)
 
+        answer_text = str(result.get("answer", ""))
         response_payload = {
             "status": str(result.get("status") or "ok"),
             "trace_id": trace_id,
             "conversation_id": conversation_id,
-            "answer": str(result.get("answer", "")),
+            "answer": answer_text,
             "selected_categories": list(result.get("selected_categories", []) or []),
             "references": list(result.get("references", []) or []),
             "warnings": warnings,
             "timings_ms": summary.get("timings_ms", {}),
         }
+        if not answer_text.strip():
+            response_payload["no_answer_reason"] = {
+                "message": "No se pudo generar respuesta: revisa las categorías y la evidencia",
+                "warnings": warnings,
+                "degrade_steps": degrade_steps,
+            }
         if req.debug:
             response_payload["debug_info"] = summary
         return JSONResponse(status_code=200, content=response_payload)

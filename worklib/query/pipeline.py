@@ -445,11 +445,36 @@ def run_pipeline_resilient(
     all_hits = _cap_evidence_chars((all_hits or [])[:30], opts.max_context_chars)
     references = _collect_references(manifest, all_hits)
 
+    if debug:
+        telemetry = get_telemetry()
+        timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
+        print("[DEBUG] run_pipeline_resilient snapshot", {
+            "selected_categories": selected_categories,
+            "category_infos": [{"category": x.get("category"), "docs": x.get("docs"), "vs_exists": x.get("vs_exists")} for x in category_infos],
+            "retrieval_cache_hit": retrieval_cache_hit,
+            "all_hits_len": len(all_hits or []),
+            "timings_ms": {
+                "pick": timings.get("pick"),
+                "confirm": timings.get("confirm"),
+                "refine": timings.get("refine"),
+                "retrieval": timings.get("retrieval"),
+                "answer_generation": timings.get("answer_generation"),
+            },
+        })
+
     if _remaining_s() < 5 and not all_hits:
         warning = "No alcancé a consultar documentos a tiempo"
         warnings.append(warning)
         labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
         answer = f"{warning}.\n\nRespuesta de mejor esfuerzo para: '{question}'.\nCategorías consideradas: {labels}."
+        if debug:
+            print("[DEBUG] run_pipeline_resilient fallback", {
+                "reason": "sin tiempo o evidencia (mejor esfuerzo)",
+                "answer_len": len(answer),
+                "answer_preview": answer[:220],
+                "warnings": warnings,
+                "degrade_steps": degrade_steps,
+            })
         return {
             "status": "ok",
             "answer": answer,
@@ -465,11 +490,45 @@ def run_pipeline_resilient(
         "answer_generation",
         lambda: _run_with_timeout(write_timeout, lambda: write_answer(q_final, all_hits, debug=debug), ""),
     )
+    if debug:
+        print("[DEBUG] run_pipeline_resilient answer", {
+            "answer_len": len(answer or ""),
+            "answer_preview": str(answer or "")[:220],
+            "warnings": warnings,
+            "degrade_steps": degrade_steps,
+        })
     if not answer:
         warning = "No alcancé a consultar documentos a tiempo"
         warnings.append(warning)
         labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
         answer = f"{warning}.\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
+        if debug:
+            print("[DEBUG] run_pipeline_resilient fallback", {
+                "reason": "answer vacía (mejor esfuerzo)",
+                "answer_len": len(answer),
+                "answer_preview": answer[:220],
+                "warnings": warnings,
+                "degrade_steps": degrade_steps,
+            })
+
+    if debug:
+        telemetry = get_telemetry()
+        timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
+        print("[DEBUG] run_pipeline_resilient done", {
+            "timings_ms": {
+                "pick": timings.get("pick"),
+                "confirm": timings.get("confirm"),
+                "refine": timings.get("refine"),
+                "retrieval": timings.get("retrieval"),
+                "answer_generation": timings.get("answer_generation"),
+            },
+            "selected_categories": selected_categories,
+            "category_infos": [{"category": x.get("category"), "docs": x.get("docs"), "vs_exists": x.get("vs_exists")} for x in category_infos],
+            "retrieval_cache_hit": retrieval_cache_hit,
+            "all_hits_len": len(all_hits or []),
+            "warnings": warnings,
+            "degrade_steps": degrade_steps,
+        })
 
     return {
         "status": "ok",
