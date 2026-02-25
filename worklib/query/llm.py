@@ -71,6 +71,12 @@ def call_text(
     telemetry = get_telemetry()
     stage_name = get_current_stage() or "unknown"
     debug_active = bool(debug or is_debug_enabled())
+    if debug_active:
+        eprint("[DEBUG] TRACE_CTX", {
+            "trace_id": getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace",
+            "stage_name": stage_name,
+            "where": "call_text_enter",
+        })
     if telemetry is not None:
         telemetry.note_model_call(model)
 

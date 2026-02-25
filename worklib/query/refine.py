@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from worklib.prompt_loader import load_prompt
 from .llm import call_text, eprint, MODEL_REFINE
+from .telemetry import get_current_stage, get_telemetry, is_debug_enabled, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry
 
 SYSTEM_REFINER_A1 = load_prompt("query_refiner_a1_system")
 SYSTEM_REFINER_A2 = load_prompt("query_refiner_a2_system")
@@ -54,8 +55,23 @@ def refine_all(
     base_context = {"question": question, "must_include_terms": must_include_terms, "avoid_terms": avoid_terms}
     systems = [SYSTEM_REFINER_A1, SYSTEM_REFINER_A2, SYSTEM_REFINER_A3]
     out: List[Dict[str, Any]] = []
+    telemetry = get_telemetry()
+    stage_name = get_current_stage() or "refine"
+    debug_ctx = bool(debug or is_debug_enabled())
+
+    def _run_refine(sys_prompt: str) -> Dict[str, Any]:
+        tele_token = set_telemetry(telemetry)
+        stage_token = set_current_stage(stage_name)
+        debug_token = set_debug_enabled(debug_ctx)
+        try:
+            return refine_one(sys_prompt, base_context, debug=debug_ctx)
+        finally:
+            reset_debug_enabled(debug_token)
+            reset_current_stage(stage_token)
+            reset_telemetry(tele_token)
+
     with ThreadPoolExecutor(max_workers=min(max_workers, len(systems))) as ex:
-        futs = [ex.submit(refine_one, sys_p, base_context, debug=debug) for sys_p in systems]
+        futs = [ex.submit(_run_refine, sys_p) for sys_p in systems]
         for fut in as_completed(futs):
             out.append(fut.result())
     order = {"A1": 0, "A2": 1, "A3": 2}

@@ -69,7 +69,8 @@ class PipelineTimeoutsRequest(BaseModel):
     # temporary to reduce false timeouts during debugging; adjust later
     confirm_s: float = Field(default=20, ge=1, le=120)
     refine_s: float = Field(default=20, ge=1, le=120)
-    retrieve_per_cat_s: float = Field(default=15, ge=1, le=180)
+    # debug stabilization; retrieval with tool-calls can be slow
+    retrieve_per_cat_s: float = Field(default=30, ge=1, le=180)
     write_s: float = Field(default=45, ge=1, le=180)
 
 

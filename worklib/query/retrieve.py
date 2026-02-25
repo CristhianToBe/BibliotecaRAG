@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from .llm import call_text, eprint, safe_get, MODEL_FAST
+from .telemetry import get_current_stage, get_telemetry, is_debug_enabled, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -116,9 +117,23 @@ def retrieve_via_tool(
     # ejecutar en paralelo
     all_results: List[Dict[str, Any]] = []
     workers = max(1, min(int(max_workers), len(chunks)))
+    telemetry = get_telemetry()
+    stage_name = get_current_stage() or "retrieval"
+    debug_ctx = bool(debug or is_debug_enabled())
+
+    def _run_chunk_ctx(vs_chunk: List[str]) -> List[Dict[str, Any]]:
+        tele_token = set_telemetry(telemetry)
+        stage_token = set_current_stage(stage_name)
+        debug_token = set_debug_enabled(debug_ctx)
+        try:
+            return _run_chunk(vs_chunk)
+        finally:
+            reset_debug_enabled(debug_token)
+            reset_current_stage(stage_token)
+            reset_telemetry(tele_token)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_run_chunk, ch): ch for ch in chunks}
+        futs = {ex.submit(_run_chunk_ctx, ch): ch for ch in chunks}
         for fut in as_completed(futs):
             ch = futs[fut]
             try:

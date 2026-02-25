@@ -38,7 +38,8 @@ class PipelineTimeouts:
     # temporary to reduce false timeouts during debugging; adjust later
     confirm_s: float = 20.0
     refine_s: float = 20.0
-    retrieve_per_cat_s: float = 15.0
+    # debug stabilization; retrieval with tool-calls can be slow
+    retrieve_per_cat_s: float = 30.0
     write_s: float = 45.0
 
 
@@ -315,6 +316,33 @@ def _retrieve_by_category(
     return all_hits
 
 
+def _retrieve_quick_fallback(
+    *,
+    q_final: str,
+    category_infos: List[Dict[str, Any]],
+    top_k: int,
+    max_workers: int,
+    debug: bool,
+) -> List[Dict[str, Any]]:
+    """Best-effort fallback: run a single simplified query per category."""
+    q_simple = _simplify_query(q_final)
+    out: List[Dict[str, Any]] = []
+    for info in category_infos:
+        vs_id = str(info.get("vector_store_id") or "").strip()
+        if not vs_id:
+            continue
+        try:
+            hits = retrieve_via_tool([vs_id], q_simple, max_num_results=max(2, min(6, top_k)), debug=False, max_workers=max_workers)
+            out.extend(hits)
+        except Exception:
+            if debug:
+                print("[DEBUG] RETRIEVAL_FALLBACK_USED", {
+                    "reason": "selector_timeout",
+                    "returned_candidates": len(out),
+                })
+    return out
+
+
 def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: float, debug: bool) -> Tuple[Dict[str, Any], bool]:
     key = _normalize_question(question)
     cached = _cache_get(_PICK_CACHE, key)
@@ -495,15 +523,17 @@ def run_pipeline_resilient(
                     })
                 except Exception:
                     cancelled = fut.cancel()
-                    _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled})
+                    _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled, "state": "done" if fut.done() else ("running" if fut.running() else "pending")})
+                    stage_state["result_used"] = "discarded"
                     _debug_log("STAGE_LATE_RESULT_POLICY", {
                         "stage_name": stage_name,
                         "used": False,
                         "reason": "late_output_not_available_within_grace",
                     })
             else:
+                stage_state["result_used"] = "discarded"
                 cancelled = fut.cancel()
-                _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled})
+                _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled, "state": "done" if fut.done() else ("running" if fut.running() else "pending")})
         except Exception as exc:
             value = fallback
             stage_result_used = "fallback"
@@ -602,7 +632,7 @@ def run_pipeline_resilient(
         pick_result, pick_timed_out, _, _, _ = _run_stage_with_timeout(
             "pick",
             pick_timeout,
-            lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug),
+            lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, False),
             ({}, False),
             timeout_grace_ms=TIMEOUT_GRACE_MS,
             allow_debug_late_output=True,
@@ -667,7 +697,7 @@ def run_pipeline_resilient(
         confirm_data, confirm_timed_out, confirm_elapsed_s, confirm_calls, confirm_result_used = _run_stage_with_timeout(
             "confirm",
             confirm_timeout,
-            lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=True, debug=debug),
+            lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=False, debug=False),
             {"categories_final": selected_categories, "suggested_categories": selected_categories, "_timeout": True},
             timeout_grace_ms=TIMEOUT_GRACE_MS,
             allow_debug_late_output=True,
@@ -701,7 +731,7 @@ def run_pipeline_resilient(
         refiners, refine_timed_out, refine_elapsed_s, refine_calls, refine_result_used = _run_stage_with_timeout(
             "refine",
             refine_timeout,
-            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug),
+            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False),
             [],
             timeout_grace_ms=TIMEOUT_GRACE_MS,
             allow_debug_late_output=True,
@@ -789,6 +819,8 @@ def run_pipeline_resilient(
                 debug=debug,
             ),
             [],
+            timeout_grace_ms=TIMEOUT_GRACE_MS,
+            allow_debug_late_output=True,
         )
         if retrieval_timed_out:
             warnings.append("Retrieval timed out; se devolvió evidencia parcial o vacía.")
@@ -798,6 +830,18 @@ def run_pipeline_resilient(
                 "budget_ms": round(retrieve_timeout * 1000, 2),
                 "stage_result_used": retrieval_result_used,
             })
+            if not all_hits:
+                all_hits = _retrieve_quick_fallback(
+                    q_final=q_final,
+                    category_infos=category_infos,
+                    top_k=opts.top_k,
+                    max_workers=max_workers,
+                    debug=debug,
+                )
+                _debug_log("RETRIEVAL_FALLBACK_USED", {
+                    "reason": "selector_timeout",
+                    "returned_candidates": len(all_hits or []),
+                })
         _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits or []), _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800))
     elif all_hits is None:
         all_hits = []
@@ -834,6 +878,37 @@ def run_pipeline_resilient(
                 "answer_generation": timings.get("answer_generation"),
             },
         })
+
+    if not all_hits:
+        warning = "No se recuperó evidencia del repositorio en esta ejecución (0 fragmentos)."
+        warnings.append(warning)
+        answer = warning
+        out = {
+            "status": "ok",
+            "answer": answer,
+            "references": [],
+            "selected_categories": selected_categories,
+            "warnings": warnings,
+            "degrade_steps": degrade_steps,
+            "retrieval_cache_hit": retrieval_cache_hit,
+        }
+        if debug:
+            out["debug_picker"] = {
+                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
+                "picked_curr": picked_curr,
+                "selected_categories": selected_categories,
+            }
+            out["debug_pipeline"] = debug_pipeline
+            out["debug_pipeline"].update({
+                "picked_curr": picked_curr,
+                "selected_categories": selected_categories,
+                "all_hits_len": len(all_hits or []),
+                "confirm_refine_executed": {
+                    "confirm": bool(debug_pipeline["stages"].get("confirm") and not debug_pipeline["stages"]["confirm"].get("skipped")),
+                    "refine": bool(debug_pipeline["stages"].get("refine") and not debug_pipeline["stages"]["refine"].get("skipped")),
+                },
+            })
+        return out
 
     if _remaining_s() < 5 and not all_hits:
         warning = "No alcancé a consultar documentos a tiempo"
@@ -1038,7 +1113,7 @@ def run_after_confirm(
         "refine",
         lambda: _run_with_timeout(
             retrieve_timeout_s,
-            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug),
+            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False),
             [{"name": "A?", "query": q_final, "constraints": {"prefer_norma_first": True}}],
         ),
     )
