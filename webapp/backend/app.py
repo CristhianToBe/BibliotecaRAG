@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,13 @@ from worklib.config import default_config
 from worklib.ingest import ingest_document
 from worklib.query.pipeline import run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
+from worklib.store import load_manifest
 
 load_dotenv()
 
 PENDING_CONVERSATIONS: dict[str, dict[str, Any]] = {}
+_CATEGORIES_CACHE_TTL_S = 60
+_categories_cache: dict[str, Any] = {"expires_at": 0.0, "categories": []}
 
 
 def _allowed_upload_exts() -> set[str]:
@@ -85,7 +89,7 @@ class ChatRequest(BaseModel):
     confirm_glimpse: bool = True
     continue_from: ContinueFrom | None = None
     pipeline: PipelineRequest = Field(default_factory=PipelineRequest)
-    manual_categories: list[str] = Field(default_factory=list)
+    manual_categories: str | list[str] = ""
 
 
 class UploadResponse(BaseModel):
@@ -141,6 +145,55 @@ def _log_trace(summary: dict[str, Any], *, degrade_steps: list[str] | None = Non
     )
 
 
+def _resolve_manifest_path(manifest_path: str | None) -> Path:
+    if manifest_path:
+        return Path(manifest_path).expanduser().resolve()
+    return Path(os.getenv("RAG_MANIFEST_PATH") or os.getenv("WORKLIB_MANIFEST_PATH") or str(default_config().manifest_path)).resolve()
+
+
+def _normalize_manual_categories(raw: str | list[str] | None) -> list[str]:
+    if isinstance(raw, list):
+        parts = [str(item).strip() for item in raw]
+    else:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        separator = "+" if "+" in text else ","
+        if "+" in text and "," in text:
+            parts = [chunk.strip() for chunk in text.replace(",", "+").split("+")]
+        else:
+            parts = [chunk.strip() for chunk in text.split(separator)]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+@app.get("/api/categories")
+def list_categories(manifest_path: str | None = None) -> dict[str, list[str]]:
+    now = time.time()
+    if manifest_path is None and _categories_cache["expires_at"] > now:
+        return {"categories": list(_categories_cache["categories"])}
+
+    path = _resolve_manifest_path(manifest_path)
+    manifest = load_manifest(path)
+    categories = sorted([str(name).strip() for name in manifest.categories.keys() if str(name).strip()], key=str.casefold)
+
+    if manifest_path is None:
+        _categories_cache["categories"] = categories
+        _categories_cache["expires_at"] = now + _CATEGORIES_CACHE_TTL_S
+
+    return {"categories": categories}
+
+
 @app.post("/api/chat")
 def chat(req: ChatRequest):
     question = (req.message or req.question or "").strip()
@@ -167,7 +220,7 @@ def chat(req: ChatRequest):
             payload = {
                 "message": question,
                 "manifest_path": req.manifest_path,
-                "manual_categories": req.manual_categories,
+                "manual_categories": _normalize_manual_categories(req.manual_categories),
             }
 
         result = run_pipeline_resilient(

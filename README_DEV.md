@@ -98,3 +98,4 @@ Selección de modelos (latencia-optimized por defecto):
 Debug:
 
 - En `/api/chat` con `debug=true`, la respuesta incluye `trace_id`, timings por etapa, tiempos de retrieval por categoría y resumen de llamadas de modelo.
+- En el frontend, **Categorías manuales** ahora funciona como autocomplete con chips: puedes escribir, filtrar y seleccionar múltiples categorías; el payload se envía en `manual_categories` como string separado por `+` (ej: `laboral+tributario`).
