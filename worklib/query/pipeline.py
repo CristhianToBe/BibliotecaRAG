@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -9,7 +10,7 @@ from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
-from .confirm import confirm_loop, confirm_loop_non_interactive
+from .confirm import confirm_loop, confirm_loop_non_interactive, confirm_once_non_interactive
 from .paths import resolve_local_path
 from .pick import pick_categories
 from .refine import refine_all
@@ -292,7 +293,16 @@ def pro_query_with_meta(
         all_hits = merge_and_dedupe_evidence(all_hits)
         all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
 
+    if debug:
+        from .llm import eprint
+
+        eprint("[DEBUG] answer generation start (with-meta)")
+    answer_started_at = time.perf_counter()
     answer = write_answer(q_final, all_hits[:30], debug=debug)
+    if debug:
+        from .llm import eprint
+
+        eprint(f"[DEBUG] answer generation end (with-meta) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
     references = _collect_references(manifest, all_hits)
 
     return {
@@ -302,15 +312,43 @@ def pro_query_with_meta(
     }
 
 
-def pro_query_non_interactive(
+
+def run_pick_confirm(
     question: str,
     *,
     manifest_path: Optional[str] = None,
+    debug: bool = False,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    mp = manifest_path or _default_manifest_path()
+    manifest = load_manifest(Path(mp))
+
+    picked = pick_categories(question, manifest.categories, debug=debug)
+    confirm = confirm_once_non_interactive(
+        question,
+        picked=picked,
+        manifest=manifest,
+        use_glimpse=confirm_glimpse,
+        debug=debug,
+    )
+    return {
+        "manifest_path": mp,
+        "question": question,
+        "picked": picked,
+        "confirm": confirm,
+    }
+
+
+def run_after_confirm(
+    question: str,
+    *,
+    selected_categories: List[str],
+    manifest_path: Optional[str] = None,
     max_workers: int = 3,
     debug: bool = False,
-    confirm: bool = True,
-    confirm_rounds: int = 4,
-    confirm_glimpse: bool = True,
+    picked: Optional[Dict[str, Any]] = None,
+    selector_instruction: str = "",
+    user_reply: str = "",
 ) -> Dict[str, Any]:
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
@@ -321,22 +359,24 @@ def pro_query_non_interactive(
     except Exception:
         library_root = None
 
-    picked = pick_categories(question, manifest.categories, debug=debug)
-    selected = list(picked.get("selected", []) or [])[:2]
+    picked_curr = picked or pick_categories(question, manifest.categories, debug=debug)
+    valid_set = set(manifest.categories.keys())
+    cats_final = [c for c in (selected_categories or []) if c in valid_set]
+    if not cats_final:
+        cats_final = [c for c in (picked_curr.get("selected", []) or [])[:2] if c in valid_set]
 
     q_final = question
-    cats_final = selected
-    if confirm:
-        q_final, cats_final, picked = confirm_loop_non_interactive(
-            question,
-            picked=picked,
-            manifest=manifest,
-            use_glimpse=confirm_glimpse,
-            debug=debug,
-        )
+    if selector_instruction or user_reply:
+        q_final = (
+            question
+            + "\n\nInstrucción de ajuste: "
+            + (selector_instruction or "")
+            + "\nRespuesta del usuario: "
+            + (user_reply or "")
+        ).strip()
 
-    must_terms = list(picked.get("must_include_terms", []) or [])
-    avoid_terms = list(picked.get("avoid_terms", []) or [])
+    must_terms = list(picked_curr.get("must_include_terms", []) or [])
+    avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
 
     refiners = refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug)
 
@@ -360,23 +400,9 @@ def pro_query_non_interactive(
 
         eprint(f"\n[DEBUG] selected categories final list: {cats_final}")
         for info in category_infos:
-            eprint(
-                "[DEBUG] category=",
-                info["category"],
-                "vector_store_id=",
-                info["vector_store_id"] or "<missing>",
-                "docs=",
-                info["docs"],
-                "vs_exists=",
-                info["vs_exists"],
-            )
+            eprint("[DEBUG] category=", info["category"], "vector_store_id=", info["vector_store_id"] or "<missing>", "docs=", info["docs"], "vs_exists=", info["vs_exists"])
 
     category_vs_ids = [str(i["vector_store_id"]).strip() for i in category_infos if str(i["vector_store_id"]).strip()]
-    if not category_vs_ids and debug:
-        from .llm import eprint
-
-        eprint("[WARN] No selected categories with vector_store_id. Consider running fill_category_vectorstores/fill_vectorstores.")
-
     fallback_vs_ids: List[str] = []
     if not category_vs_ids:
         for _, cat in manifest.categories.items():
@@ -421,26 +447,12 @@ def pro_query_non_interactive(
     if not all_hits:
         fallback_query = _simplify_query(q_final)
         if fallback_query and fallback_query != q_final:
-            if debug:
-                from .llm import eprint
-
-                eprint(f"[WARN] no hits for original/refined queries; trying fallback query: {fallback_query}")
             all_hits.extend(_retrieve_all_for_query(fallback_query, max_results=10, debug_query=debug))
 
     all_hits = merge_and_dedupe_evidence(all_hits)
     all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
-    if debug:
-        from .llm import eprint
-
-        eprint(f"[DEBUG] total hits after dedupe/paths: {len(all_hits)}")
 
     arbiter_hits = all_hits[:25]
-    if debug:
-        from .llm import eprint
-
-        first_keys = sorted(list(arbiter_hits[0].keys())) if arbiter_hits else []
-        eprint(f"[DEBUG] arbiter hits payload length: {len(arbiter_hits)} first_item_keys: {first_keys}")
-
     arb = arbitrate(q_final, refiners, arbiter_hits, debug=debug)
     best_query = (arb.get("best_query") or q_final).strip()
     if best_query and best_query != q_final:
@@ -448,14 +460,72 @@ def pro_query_non_interactive(
         all_hits = merge_and_dedupe_evidence(all_hits)
         all_hits = attach_local_paths(manifest, all_hits, library_root=library_root)
 
-    answer = write_answer(q_final, all_hits[:30], debug=debug)
-    references = _collect_references(manifest, all_hits)
+    if debug:
+        from .llm import eprint
 
+        eprint("[DEBUG] answer generation start (non-interactive)")
+    answer_started_at = time.perf_counter()
+    answer = write_answer(q_final, all_hits[:30], debug=debug)
+    if debug:
+        from .llm import eprint
+
+        eprint(f"[DEBUG] answer generation end (non-interactive) elapsed_ms={round((time.perf_counter() - answer_started_at) * 1000, 2)}")
+
+    references = _collect_references(manifest, all_hits)
     return {
         "answer": answer,
         "selected_categories": list(cats_final or []),
         "references": references,
     }
+
+def pro_query_non_interactive(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    _ = confirm_rounds
+    selected_categories: List[str] = []
+    picked: Optional[Dict[str, Any]] = None
+
+    if confirm:
+        pre = run_pick_confirm(
+            question,
+            manifest_path=manifest_path,
+            debug=debug,
+            confirm_glimpse=confirm_glimpse,
+        )
+        picked = dict(pre.get("picked") or {})
+        confirm_data = dict(pre.get("confirm") or {})
+        if debug:
+            from .llm import eprint
+
+            eprint(f"[DEBUG] non-interactive confirm action: {confirm_data.get('action')}")
+            eprint(f"[DEBUG] non-interactive confirm categories_final: {confirm_data.get('categories_final')}")
+        selected_categories = list(confirm_data.get("categories_final") or [])
+        if not selected_categories:
+            selected_categories = list(confirm_data.get("suggested_categories") or [])
+        if debug:
+            from .llm import eprint
+
+            eprint(f"[DEBUG] non-interactive chosen categories after fallback: {selected_categories}")
+    else:
+        pre = run_pick_confirm(question, manifest_path=manifest_path, debug=debug, confirm_glimpse=False)
+        picked = dict(pre.get("picked") or {})
+        selected_categories = list((picked.get("selected") or [])[:2])
+
+    return run_after_confirm(
+        question,
+        selected_categories=selected_categories,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        picked=picked,
+    )
 
 
 def pro_query(

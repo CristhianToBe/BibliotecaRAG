@@ -171,6 +171,31 @@ def confirm_loop(
     return (q_curr, suggested, picked_curr)
 
 
+
+def confirm_once_non_interactive(
+    question: str,
+    *,
+    picked: Dict[str, Any],
+    manifest: Manifest,
+    use_glimpse: bool = True,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Single non-interactive confirm pass that never asks for user input."""
+    valid = list(manifest.categories.keys())
+    suggested = list(picked.get("selected", []) or [])[:2]
+    glimpses: List[Dict[str, Any]] = _build_glimpses(manifest, suggested, question) if (use_glimpse and suggested) else []
+
+    decision = confirm_decision(
+        question,
+        suggested=suggested,
+        valid_categories=valid,
+        glimpses=glimpses,
+        user_reply="",
+        debug=debug,
+    )
+    decision["suggested_categories"] = suggested
+    return decision
+
 def confirm_loop_non_interactive(
     question: str,
     *,
@@ -197,8 +222,21 @@ def confirm_loop_non_interactive(
         debug=debug,
     )
 
+    action = str(decision.get("action") or "REFINE").strip().upper()
     cats_final = list(decision.get("categories_final") or [])
+    valid_set = set(valid)
+    cats_final = [c for c in cats_final if c in valid_set]
+    if debug:
+        eprint(f"[DEBUG] non-interactive confirm action: {action}")
+        eprint(f"[DEBUG] non-interactive confirm categories_final: {cats_final}")
+
+    # Non-interactive policy: never block on actions requiring user input.
+    # Always continue with best available categories.
     if not cats_final:
-        cats_final = [c for c in suggested if c in set(valid)]
+        cats_final = [c for c in suggested if c in valid_set]
+
+
+    if debug:
+        eprint(f"[DEBUG] non-interactive chosen categories after fallback: {cats_final}")
 
     return (question, cats_final, picked)
