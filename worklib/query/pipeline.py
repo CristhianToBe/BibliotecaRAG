@@ -72,9 +72,8 @@ def _normalize_question(question: str) -> str:
     return s
 
 
-def _normalize_category(c: str) -> str:
-    first_segment = str(c or "").split("__", 1)[0].strip()
-    return first_segment.upper()
+def _top_category_token(c: str) -> str:
+    return str(c or "").split("__", 1)[0].strip().upper()
 
 
 def _manifest_version(manifest_path: str) -> str:
@@ -158,6 +157,17 @@ def merge_and_dedupe_evidence(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         seen.add(key)
         out.append(h)
+    return out
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
     return out
 
 
@@ -328,10 +338,17 @@ def run_pipeline_resilient(
     valid_set = set(manifest.categories.keys())
 
     if not opts.use_picker and not manual_categories:
-        return {
+        out = {
             "error": "missing_minimum",
             "details": "Debes activar Picker o indicar categorías manuales.",
         }
+        if debug:
+            out["debug_picker"] = {
+                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
+                "picked_curr": {},
+                "selected_categories": [],
+            }
+        return out
 
     def _elapsed_s() -> float:
         return max(0.0, time.perf_counter() - started)
@@ -374,7 +391,6 @@ def run_pipeline_resilient(
         )
 
         raw_selected = picked_curr.get("selected") or []
-        normalized = [_normalize_category(c) for c in raw_selected]
 
         if debug:
             valid_categories = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
@@ -385,18 +401,34 @@ def run_pipeline_resilient(
                 "membership_map": membership_map,
             })
 
-        # Provisional workaround while model category names and manifest keys are harmonized.
-        selected_categories = [c for c in normalized if c in valid_set][: opts.max_categories]
+        # Primary path: preserve exact picker keys and match directly against manifest keys.
+        selected_categories = [c for c in raw_selected if c in valid_set][: opts.max_categories]
+
+        if not selected_categories and raw_selected:
+            # Provisional fallback while category naming is harmonized; remove once picker outputs stable manifest keys.
+            valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
+            expanded: List[str] = []
+            for token in [_top_category_token(c) for c in raw_selected]:
+                expanded.extend([k for k in valid_keys if _top_category_token(k) == token])
+            selected_categories = _dedupe_preserve_order(expanded)[: opts.max_categories]
+
         if not selected_categories:
             warnings.append("Picker no devolvió categorías válidas; se intentarán categorías manuales.")
     if not selected_categories and manual_categories:
         selected_categories = [c for c in manual_categories if c in valid_set][: opts.max_categories]
 
     if not selected_categories:
-        return {
+        out = {
             "error": "missing_minimum",
             "details": "Debes activar Picker o indicar categorías manuales.",
         }
+        if debug:
+            out["debug_picker"] = {
+                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
+                "picked_curr": picked_curr,
+                "selected_categories": selected_categories,
+            }
+        return out
 
     if opts.use_confirmer and selected_categories:
         confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_s() - 2))
@@ -494,7 +526,7 @@ def run_pipeline_resilient(
                 "warnings": warnings,
                 "degrade_steps": degrade_steps,
             })
-        return {
+        out = {
             "status": "ok",
             "answer": answer,
             "references": [],
@@ -503,6 +535,13 @@ def run_pipeline_resilient(
             "degrade_steps": degrade_steps,
             "retrieval_cache_hit": retrieval_cache_hit,
         }
+        if debug:
+            out["debug_picker"] = {
+                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
+                "picked_curr": picked_curr,
+                "selected_categories": selected_categories,
+            }
+        return out
 
     write_timeout = min(opts.timeouts.write_s, max(1.0, _remaining_s() - 1))
     answer = _timed_stage(
@@ -549,7 +588,7 @@ def run_pipeline_resilient(
             "degrade_steps": degrade_steps,
         })
 
-    return {
+    out = {
         "status": "ok",
         "answer": answer,
         "references": references,
@@ -558,6 +597,13 @@ def run_pipeline_resilient(
         "degrade_steps": degrade_steps,
         "retrieval_cache_hit": retrieval_cache_hit,
     }
+    if debug:
+        out["debug_picker"] = {
+            "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
+            "picked_curr": picked_curr,
+            "selected_categories": selected_categories,
+        }
+    return out
 
 
 def run_pick_confirm(

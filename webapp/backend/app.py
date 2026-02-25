@@ -330,27 +330,13 @@ async def chat(request: Request):
         pipeline_payload["use_picker"] = bool(effective_use_picker)
 
         debug_manifest_keys: list[str] = []
-        debug_picked_curr: dict[str, Any] = {}
-        debug_selected_categories: list[str] = []
 
         if req.debug:
             try:
                 manifest_debug = load_manifest(_resolve_manifest_path(payload.get("manifest_path")))
                 debug_manifest_keys = list(manifest_debug.categories.keys()) if isinstance(manifest_debug.categories, dict) else []
-                debug_valid_set = set(debug_manifest_keys)
-                if effective_use_picker:
-                    debug_picked_curr = pick_categories(payload["message"], manifest_debug.categories, debug=True) or {}
-                    raw_selected = debug_picked_curr.get("selected") or []
-                    normalized = [_normalize_picker_category(c) for c in raw_selected]
-                    # Provisional workaround while picker and manifest naming conventions are aligned.
-                    debug_selected_categories = [c for c in normalized if c in debug_valid_set][: int(pipeline_payload.get("max_categories", 2))]
-                print("[DEBUG] /api/chat picker_vs_manifest", {
-                    "manifest.categories.keys()": debug_manifest_keys,
-                    "picked_curr": debug_picked_curr,
-                    "selected_categories": debug_selected_categories,
-                })
             except Exception as exc:
-                print("[DEBUG] /api/chat picker_vs_manifest_error", str(exc))
+                print("[DEBUG] /api/chat manifest_keys_error", str(exc))
 
         result = run_pipeline_resilient(
             payload["message"],
@@ -361,6 +347,14 @@ async def chat(request: Request):
             manual_categories=payload.get("manual_categories"),
         )
         if req.debug:
+            debug_picker = result.get("debug_picker") if isinstance(result, dict) else {}
+            if not isinstance(debug_picker, dict):
+                debug_picker = {}
+            print("[DEBUG] /api/chat picker_vs_manifest", {
+                "manifest.categories.keys()": debug_manifest_keys,
+                "picked_curr": debug_picker.get("picked_curr", {}),
+                "selected_categories": debug_picker.get("selected_categories", result.get("selected_categories")),
+            })
             print("[DEBUG] /api/chat pipeline result", {
                 "result": result,
                 "answer": result.get("answer"),
@@ -373,7 +367,7 @@ async def chat(request: Request):
                 "raw_top_level_manual_categories": raw_top_level_manual_categories,
                 "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
                 "manifest.categories.keys()": debug_manifest_keys,
-                "picked_curr": debug_picked_curr,
+                "picked_curr": debug_picker.get("picked_curr", {}),
                 "selected_categories": result.get("selected_categories"),
             })
 
