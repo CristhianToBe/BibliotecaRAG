@@ -368,7 +368,23 @@
           },
           buildPayload(q) {
             const manual = this.selectedManualCategories.join('+');
-            return { message: q, debug: this.debugMode, pipeline: this.settings, manual_categories: manual };
+            const payload = {
+              message: q,
+              debug: this.debugMode,
+              pipeline: {
+                use_picker: !!this.settings.use_picker,
+                use_confirmer: !!this.settings.use_confirmer,
+                use_refiner: !!this.settings.use_refiner,
+                max_categories: Number(this.settings.max_categories),
+                top_k: Number(this.settings.top_k),
+                timeouts: {
+                  total_s: Number(this.settings.timeouts.total_s),
+                },
+              },
+            };
+            if (!this.settings.use_picker || manual) payload.manual_categories = manual;
+            if (this.debugMode) console.log('[DEBUG_CHAT_PAYLOAD]', JSON.stringify(payload));
+            return payload;
           },
           async sendQuestion() {
             const q = this.question.trim();
