@@ -7,30 +7,28 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <style>
       body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #122; }
-      .wrap { max-width: 980px; margin: 0 auto; padding: 20px; }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
       .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
       .card { background: #fff; border-radius: 10px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
       .row { margin-bottom: 10px; }
-      input, textarea, button { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccd; }
+      input, textarea, button, select { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #ccd; }
       button { cursor: pointer; background: #1f6feb; color: white; border: none; }
       button:disabled { background: #9db7e8; }
-      .chat { min-height: 260px; max-height: 460px; overflow: auto; border: 1px solid #e5e9f2; border-radius: 8px; padding: 12px; background: #fafcff; margin-bottom: 10px; display: flex; flex-direction: column; gap: 10px; }
+      .chat { min-height: 280px; max-height: 540px; overflow: auto; border: 1px solid #e5e9f2; border-radius: 8px; padding: 12px; background: #fafcff; margin-bottom: 10px; display: flex; flex-direction: column; gap: 10px; }
       .msg-row { display: flex; }
       .msg-row.you { justify-content: flex-end; }
       .msg-row.bot { justify-content: flex-start; }
-      .msg { margin: 0; white-space: pre-wrap; max-width: 85%; border-radius: 10px; padding: 10px 12px; border: 1px solid #dbe3f1; }
+      .msg { margin: 0; white-space: pre-wrap; max-width: 92%; border-radius: 10px; padding: 10px 12px; border: 1px solid #dbe3f1; }
       .msg.you { background: #dff0ff; color: #0b5394; }
       .msg.bot { background: #fff; color: #1a1a1a; }
-      .chat-controls { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
       .toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #334; }
       .toggle input { width: auto; }
       .small { font-size: 12px; color: #667; }
+      .warn-list { margin: 8px 0 0 14px; color: #8a4b00; }
+      .warn-list li { margin-bottom: 4px; }
       .citations { margin-top: 6px; padding-left: 18px; }
       .citations li { margin-bottom: 4px; }
-      details.debug { margin-top: 8px; padding: 8px; border: 1px dashed #c9d4ea; border-radius: 8px; background: #f7f9fe; }
-      details.debug summary { cursor: pointer; font-weight: 600; }
-      .debug-list { margin: 6px 0 0 16px; }
-      .debug-list li { margin-bottom: 4px; }
+      .inline { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
       .progress { width: 100%; background: #e9edf6; border-radius: 8px; overflow: hidden; height: 10px; margin-top: 8px; }
       .progress > div { height: 100%; background: #1f6feb; transition: width 0.2s; }
       .ok { color: #176b2f; }
@@ -41,74 +39,52 @@
   <body>
     <div id="app" class="wrap">
       <h1>BibliotecaRAG Web</h1>
-      <p class="small">Chat + upload sobre el mismo motor Python de CLI (sin shell out).</p>
       <div class="grid">
         <section class="card">
           <h2>Chat</h2>
-          <div class="chat-controls">
-            <span class="small">Conversación</span>
-            <label class="toggle">
-              <input type="checkbox" v-model="debugMode" />
-              Debug mode
-            </label>
-          </div>
+          <label class="toggle"><input type="checkbox" v-model="debugMode" /> Debug mode</label>
           <div class="chat" ref="chatBox">
             <div v-for="(m, idx) in messages" :key="idx" class="msg-row" :class="m.role === 'you' ? 'you' : 'bot'">
               <div class="msg" :class="m.role === 'you' ? 'you' : 'bot'">
                 <strong>{{ m.role === 'you' ? 'Tú' : 'RAG' }}:</strong> {{ m.text }}
-              <div class="small" v-if="m.selectedCategories && m.selectedCategories.length">
-                Categorías: {{ m.selectedCategories.join(', ') }}
-              </div>
-              <ul class="citations small" v-if="m.references && m.references.length">
-                <li v-for="(r, ridx) in m.references" :key="`${idx}-${ridx}`">
-                  <strong>{{ r.filename || '(sin nombre)' }}</strong> · doc_id={{ r.doc_id || '-' }}
-                  <div>{{ r.abs_path || '-' }}</div>
-                </li>
-              </ul>
-                <details class="debug small" v-if="m.debugInfo && (m.debugInfo.selected_categories?.length || m.debugInfo.references?.length)">
-                  <summary>Debug Info</summary>
-                  <div v-if="m.debugInfo.timings">Timings: {{ JSON.stringify(m.debugInfo.timings) }}</div>
-                  <div v-if="m.debugInfo.selected_categories?.length">
-                    <strong>Selected categories</strong>
-                    <ul class="debug-list">
-                      <li v-for="(cat, cidx) in m.debugInfo.selected_categories" :key="`${idx}-cat-${cidx}`">{{ cat }}</li>
-                    </ul>
-                  </div>
-                  <div v-if="m.debugInfo.references?.length">
-                    <strong>References</strong>
-                    <ul class="debug-list">
-                      <li v-for="(r, dridx) in m.debugInfo.references" :key="`${idx}-dbg-${dridx}`">
-                        doc_id={{ r.doc_id || '-' }} · {{ r.filename || '(sin nombre)' }}
-                        <div>{{ r.abs_path || '-' }}</div>
-                      </li>
-                    </ul>
-                  </div>
-                </details>
+                <div class="small" v-if="m.selectedCategories && m.selectedCategories.length">Categorías: {{ m.selectedCategories.join(', ') }}</div>
+                <ul class="warn-list small" v-if="m.warnings && m.warnings.length"><li v-for="(w, widx) in m.warnings" :key="`${idx}-${widx}`">{{ w }}</li></ul>
+                <ul class="citations small" v-if="m.references && m.references.length">
+                  <li v-for="(r, ridx) in m.references" :key="`${idx}-${ridx}`">{{ r.filename || '(sin nombre)' }} · doc_id={{ r.doc_id || '-' }}</li>
+                </ul>
+                <div class="small" v-if="m.timings">timings_ms: {{ JSON.stringify(m.timings) }}</div>
               </div>
             </div>
           </div>
 
           <div class="small" v-if="loadingChat">Etapa actual: {{ currentStageLabel }}</div>
-          <div class="row">
-            <textarea v-model="question" rows="3" :placeholder="inputPlaceholder"></textarea>
-          </div>
-          <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">
-            {{ loadingChat ? `Consultando... ${currentStageLabel}` : 'Enviar pregunta' }}
-          </button>
+          <div class="row"><textarea v-model="question" rows="3" placeholder="Haz una pregunta..."></textarea></div>
+          <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">{{ loadingChat ? `Consultando... ${currentStageLabel}` : 'Enviar pregunta' }}</button>
         </section>
 
         <section class="card">
+          <h2>Ajustes</h2>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_picker" /> Picker</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_confirmer" /> Confirmer / Árbitro</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_refiner" /> Refiner</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="multiCategory" /> Multi-categoría</label></div>
+          <div class="row inline">
+            <button @click="applyFastMode">Modo rápido</button>
+            <button @click="applyFullMode">Modo completo</button>
+          </div>
+          <div class="row"><label class="small">Max categorías</label><input type="number" min="1" max="3" v-model.number="settings.max_categories" /></div>
+          <div class="row"><label class="small">Top-K</label><input type="number" min="1" max="30" v-model.number="settings.top_k" /></div>
+          <div class="row"><label class="small">Timeout total (s)</label><input type="number" min="5" max="600" v-model.number="settings.timeouts.total_s" /></div>
+          <div class="row"><label class="small">Categorías manuales (coma)</label><input :disabled="settings.use_picker" v-model="manualCategoriesRaw" placeholder="laboral, tributario" /></div>
+
+          <hr />
           <h2>Upload</h2>
           <div class="row"><input v-model="title" placeholder="Título (opcional)" /></div>
           <div class="row"><input v-model="author" placeholder="Autor (opcional)" /></div>
           <div class="row"><input v-model="tags" placeholder="Tags separadas por coma" /></div>
           <div class="row"><input type="file" @change="onFile" /></div>
-          <button @click="uploadFile" :disabled="loadingUpload || !selectedFile">
-            {{ loadingUpload ? 'Ingestando...' : 'Subir documento' }}
-          </button>
-          <div class="progress" v-if="loadingUpload">
-            <div :style="{ width: uploadProgress + '%' }"></div>
-          </div>
+          <button @click="uploadFile" :disabled="loadingUpload || !selectedFile">{{ loadingUpload ? 'Ingestando...' : 'Subir documento' }}</button>
+          <div class="progress" v-if="loadingUpload"><div :style="{ width: uploadProgress + '%' }"></div></div>
           <p class="small" :class="uploadOk ? 'ok' : 'err'" v-if="uploadStatus">{{ uploadStatus }}</p>
         </section>
       </div>
@@ -124,6 +100,20 @@
             question: "",
             messages: [],
             loadingChat: false,
+            debugMode: false,
+            currentStageLabel: "iniciando",
+            stageTicker: null,
+            multiCategory: true,
+            manualCategoriesRaw: "",
+            settings: {
+              use_picker: true,
+              use_confirmer: false,
+              use_refiner: false,
+              max_categories: 2,
+              top_k: 8,
+              max_context_chars: 12000,
+              timeouts: { total_s: 120, pick_s: 10, confirm_s: 10, refine_s: 10, retrieve_per_cat_s: 15, write_s: 45 },
+            },
             selectedFile: null,
             title: "",
             author: "",
@@ -132,73 +122,64 @@
             uploadProgress: 0,
             uploadStatus: "",
             uploadOk: false,
-            debugMode: false,
-            pendingConfirm: null,
-            originalQuestion: "",
-            currentStageLabel: "iniciando",
-            stageTicker: null,
           };
         },
-        computed: {
-          inputPlaceholder() {
-            return this.pendingConfirm ? "Responde para ajustar el enfoque..." : "Haz una pregunta...";
+        watch: {
+          multiCategory(v) {
+            if (!v && this.settings.max_categories > 1) this.settings.max_categories = 1;
           },
         },
         methods: {
-          scrollChatToBottom() {
-            this.$nextTick(() => {
-              const el = this.$refs.chatBox;
-              if (!el) return;
-              el.scrollTop = el.scrollHeight;
-            });
+          applyFastMode() {
+            this.settings.use_confirmer = false;
+            this.settings.use_refiner = false;
+            this.multiCategory = false;
+            this.settings.max_categories = 1;
+            this.settings.top_k = 4;
+          },
+          applyFullMode() {
+            this.settings.use_confirmer = true;
+            this.settings.use_refiner = true;
+            this.multiCategory = true;
+            this.settings.max_categories = 2;
+            this.settings.top_k = 8;
           },
           extractError(data, fallback) {
             if (!data) return fallback;
             if (typeof data.detail === 'string') return data.detail;
             if (typeof data.details === 'string') return data.details;
-            if (data.detail && data.detail.detail) return data.detail.detail;
-            if (data.detail && data.detail.error) return `${data.detail.error}: ${data.detail.detail || ''}`;
+            if (data.error === 'missing_minimum') return data.details || fallback;
             return fallback;
+          },
+          scrollChatToBottom() {
+            this.$nextTick(() => {
+              const el = this.$refs.chatBox;
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+          },
+          buildPayload(q) {
+            const manual = this.manualCategoriesRaw.split(',').map((x) => x.trim()).filter(Boolean);
+            return { message: q, debug: this.debugMode, pipeline: this.settings, manual_categories: manual };
           },
           async sendQuestion() {
             const q = this.question.trim();
             if (!q || this.loadingChat) return;
-            this.messages.push({ role: "you", text: q });
-            this.scrollChatToBottom();
-            this.question = "";
+            this.messages.push({ role: 'you', text: q });
+            this.question = '';
             this.loadingChat = true;
+            this.scrollChatToBottom();
             try {
-              let payload;
-              if (this.pendingConfirm) {
-                payload = {
-                  conversation_id: this.pendingConfirm.conversation_id,
-                  message: this.originalQuestion,
-                  debug: this.debugMode,
-                  continue_from: {
-                    stage: "confirm_refine",
-                    user_reply: q,
-                    selector_instruction: this.pendingConfirm.selector_instruction || "",
-                    selected_categories: this.pendingConfirm.selected_categories || [],
-                  },
-                };
-              } else {
-                this.originalQuestion = q;
-                payload = { message: q, debug: this.debugMode };
-              }
-
-              if (this.debugMode) {
-                console.log('[Debug] request payload', payload);
-              }
-
+              const payload = this.buildPayload(q);
               const controller = new AbortController();
-              const timeoutId = setTimeout(() => controller.abort(), 95000);
-              const stageSteps = ["pick", "confirm", "retrieving", "answering"];
+              const timeoutMs = Math.max(10000, (this.settings.timeouts.total_s + 10) * 1000);
+              const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+              const stageSteps = ['pick', 'confirm', 'refine', 'retrieving', 'answering'];
               let idx = 0;
               this.currentStageLabel = stageSteps[idx];
               this.stageTicker = setInterval(() => {
                 idx = Math.min(stageSteps.length - 1, idx + 1);
                 this.currentStageLabel = stageSteps[idx];
-              }, 6000);
+              }, 5000);
 
               const r = await fetch(`${API_BASE}/api/chat`, {
                 method: 'POST',
@@ -208,72 +189,41 @@
               });
               clearTimeout(timeoutId);
               const data = await r.json();
-              if (this.debugMode) {
-                console.log('[Debug] raw response JSON', data);
-              }
               if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
-
-              if (data.status === 'needs_user') {
-                this.currentStageLabel = "needs user";
-                this.pendingConfirm = {
-                  conversation_id: data.conversation_id,
-                  selector_instruction: data.selector_instruction || '',
-                  selected_categories: data.selected_categories || [],
-                };
-                this.messages.push({
-                  role: "bot",
-                  text: data.prompt || "Necesito más detalle para ajustar la búsqueda.",
-                  references: [],
-                });
-              } else {
-                this.currentStageLabel = "done";
-                this.pendingConfirm = null;
-                this.messages.push({
-                  role: "bot",
-                  text: data.answer || "(sin respuesta)",
-                  selectedCategories: data.selected_categories || [],
-                  references: data.references || [],
-                  debugInfo: this.debugMode ? data.debug_info || null : null,
-                });
-              }
+              this.messages.push({
+                role: 'bot',
+                text: data.answer || '(sin respuesta)',
+                selectedCategories: data.selected_categories || [],
+                references: data.references || [],
+                warnings: data.warnings || [],
+                timings: this.debugMode ? data.timings_ms || null : null,
+              });
+              this.currentStageLabel = 'done';
               this.scrollChatToBottom();
             } catch (e) {
-              if (this.debugMode) {
-                console.error('[Debug] errors', e);
-              }
-              const friendly = (e && e.name === "AbortError") ? "La consulta tardó demasiado. Intenta una pregunta más concreta." : e.message;
-              this.messages.push({ role: "bot", text: `Error: ${friendly}`, references: [] });
+              const friendly = (e && e.name === 'AbortError') ? 'La consulta sigue en proceso. Intenta modo rápido o timeout mayor.' : e.message;
+              this.messages.push({ role: 'bot', text: `Error: ${friendly}`, references: [] });
               this.scrollChatToBottom();
             } finally {
               this.loadingChat = false;
               if (this.stageTicker) { clearInterval(this.stageTicker); this.stageTicker = null; }
             }
           },
-          onFile(event) {
-            this.selectedFile = event.target.files?.[0] || null;
-          },
+          onFile(event) { this.selectedFile = event.target.files?.[0] || null; },
           uploadFile() {
             if (!this.selectedFile || this.loadingUpload) return;
             this.loadingUpload = true;
             this.uploadProgress = 0;
             this.uploadStatus = '';
             this.uploadOk = false;
-
             const form = new FormData();
             form.append('file', this.selectedFile);
             form.append('title', this.title);
             form.append('author', this.author);
             form.append('tags', this.tags);
-
             const xhr = new XMLHttpRequest();
             xhr.open('POST', `${API_BASE}/api/upload`);
-
-            xhr.upload.onprogress = (e) => {
-              if (e.lengthComputable) {
-                this.uploadProgress = Math.round((e.loaded / e.total) * 100);
-              }
-            };
-
+            xhr.upload.onprogress = (e) => { if (e.lengthComputable) this.uploadProgress = Math.round((e.loaded / e.total) * 100); };
             xhr.onload = () => {
               this.loadingUpload = false;
               let data = {};
@@ -284,18 +234,15 @@
                 this.uploadStatus = `OK (${detail.status || 'ingested'}) · categoría=${detail.category || '-'} · doc_id=${detail.doc_id || '-'}`;
                 this.uploadProgress = 100;
               } else {
-                this.currentStageLabel = "done";
                 this.uploadOk = false;
                 this.uploadStatus = `Error: ${this.extractError(data, 'Error en upload')}`;
               }
             };
-
             xhr.onerror = () => {
               this.loadingUpload = false;
               this.uploadOk = false;
               this.uploadStatus = 'Error de red durante el upload';
             };
-
             xhr.send(form);
           },
         },
