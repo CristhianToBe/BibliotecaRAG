@@ -16,6 +16,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
+from worklib.query.pick import pick_categories
 from worklib.query.pipeline import run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
 from worklib.store import load_manifest
@@ -218,6 +219,10 @@ def _normalize_manual_categories(raw: str | list[str] | None) -> list[str]:
         seen.add(key)
         out.append(item)
     return out
+
+
+def _normalize_picker_category(raw: Any) -> str:
+    return str(raw or "").split("__", 1)[0].strip().upper()
 
 
 @app.get("/api/categories")
