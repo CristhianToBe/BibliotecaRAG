@@ -16,6 +16,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
+from worklib.query.pick import pick_categories
 from worklib.query.pipeline import run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
 from worklib.store import load_manifest
@@ -220,6 +221,10 @@ def _normalize_manual_categories(raw: str | list[str] | None) -> list[str]:
     return out
 
 
+def _normalize_picker_category(raw: Any) -> str:
+    return str(raw or "").split("__", 1)[0].strip().upper()
+
+
 @app.get("/api/categories")
 def list_categories(manifest_path: str | None = None) -> dict[str, list[str]]:
     now = time.time()
@@ -324,6 +329,29 @@ async def chat(request: Request):
         pipeline_payload = req.pipeline.model_dump() if req.pipeline else PipelineRequest().model_dump()
         pipeline_payload["use_picker"] = bool(effective_use_picker)
 
+        debug_manifest_keys: list[str] = []
+        debug_picked_curr: dict[str, Any] = {}
+        debug_selected_categories: list[str] = []
+
+        if req.debug:
+            try:
+                manifest_debug = load_manifest(_resolve_manifest_path(payload.get("manifest_path")))
+                debug_manifest_keys = list(manifest_debug.categories.keys()) if isinstance(manifest_debug.categories, dict) else []
+                debug_valid_set = set(debug_manifest_keys)
+                if effective_use_picker:
+                    debug_picked_curr = pick_categories(payload["message"], manifest_debug.categories, debug=True) or {}
+                    raw_selected = debug_picked_curr.get("selected") or []
+                    normalized = [_normalize_picker_category(c) for c in raw_selected]
+                    # Provisional workaround while picker and manifest naming conventions are aligned.
+                    debug_selected_categories = [c for c in normalized if c in debug_valid_set][: int(pipeline_payload.get("max_categories", 2))]
+                print("[DEBUG] /api/chat picker_vs_manifest", {
+                    "manifest.categories.keys()": debug_manifest_keys,
+                    "picked_curr": debug_picked_curr,
+                    "selected_categories": debug_selected_categories,
+                })
+            except Exception as exc:
+                print("[DEBUG] /api/chat picker_vs_manifest_error", str(exc))
+
         result = run_pipeline_resilient(
             payload["message"],
             manifest_path=payload.get("manifest_path"),
@@ -336,7 +364,6 @@ async def chat(request: Request):
             print("[DEBUG] /api/chat pipeline result", {
                 "result": result,
                 "answer": result.get("answer"),
-                "selected_categories": result.get("selected_categories"),
                 "warnings": result.get("warnings"),
                 "degrade_steps": result.get("degrade_steps"),
                 "references": result.get("references"),
@@ -345,6 +372,9 @@ async def chat(request: Request):
                 "effective_manual_categories": effective_manual_categories,
                 "raw_top_level_manual_categories": raw_top_level_manual_categories,
                 "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
+                "manifest.categories.keys()": debug_manifest_keys,
+                "picked_curr": debug_picked_curr,
+                "selected_categories": result.get("selected_categories"),
             })
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
