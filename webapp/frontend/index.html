@@ -47,12 +47,15 @@
       .debug-panel h4 { margin: 0 0 6px 0; font-size: 12px; color: #234; }
       .debug-grid { display: grid; grid-template-columns: 170px 1fr; gap: 4px 8px; }
       .debug-grid code { white-space: pre-wrap; word-break: break-word; }
+      .banner { margin: 10px 0; padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+      .err-banner { background: #fee4e2; color: #b42318; border: 1px solid #fda29b; }
       @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
     <div id="app" class="wrap">
       <h1>BibliotecaRAG Web</h1>
+      <div class="banner err-banner" v-if="backendUnavailable">Backend no disponible en {{ resolvedApiBase }}</div>
       <div class="grid">
         <section class="card">
           <h2>Chat</h2>
@@ -124,9 +127,11 @@
               </span>
             </div>
             <div class="small err" v-if="manualCategoriesError">{{ manualCategoriesError }}</div>
-            <div class="debug-panel" v-if="debugMode && !settings.use_picker">
+            <div class="debug-panel" v-if="debugMode">
               <h4>Debug panel</h4>
               <div class="debug-grid">
+                <strong>API_BASE:</strong><code>{{ resolvedApiBase }}</code>
+                <strong>backendHealth:</strong><code>{{ JSON.stringify(backendHealth) }}</code>
                 <strong>categoriesLoaded:</strong><code>{{ availableCategories.length }}</code>
                 <strong>lastCategoriesFetch:</strong><code>{{ JSON.stringify(lastCategoriesFetch) }}</code>
                 <strong>dropdownOpen:</strong><code>{{ showSuggestions }}</code>
@@ -154,7 +159,16 @@
 
     <script>
       const { createApp } = Vue;
-      const API_BASE = '';
+      const API_BASE = (() => {
+        if (typeof window.API_BASE === 'string' && window.API_BASE.trim()) {
+          return window.API_BASE.trim().replace(/\/$/, '');
+        }
+        if (window.location.hostname === '127.0.0.1' && window.location.port === '8000') {
+          return '';
+        }
+        return 'http://127.0.0.1:8000';
+      })();
+      const apiUrl = (path) => `${API_BASE}${path}`;
 
       createApp({
         data() {
@@ -174,7 +188,10 @@
             manualCategoriesError: "",
             blurCloseTimeout: null,
             pendingSuggestionClick: false,
-            lastCategoriesFetch: { status: 'idle', url: `${API_BASE}/api/categories`, error: '' },
+            lastCategoriesFetch: { status: 'idle', url: apiUrl('/api/categories'), error: '', stack: '' },
+            backendUnavailable: false,
+            backendHealth: { status: 'idle', url: apiUrl('/api/health'), error: '' },
+            resolvedApiBase: API_BASE || '(same-origin)',
             lastCategoryEvent: null,
             settings: {
               use_picker: true,
@@ -220,8 +237,9 @@
               .slice(0, 10);
           },
         },
-        mounted() {
+        async mounted() {
           document.addEventListener('click', this.onOutsideClick);
+          await this.checkBackendHealth();
           this.loadCategories();
         },
         unmounted() {
@@ -238,24 +256,42 @@
             this.lastCategoryEvent = payload;
             console.log('[CAT_DEBUG]', payload);
           },
+          async checkBackendHealth() {
+            const url = apiUrl('/api/health');
+            try {
+              const r = await fetch(url);
+              const data = await r.json();
+              if (!r.ok || !data?.ok) throw new Error(`HTTP ${r.status}`);
+              this.backendUnavailable = false;
+              this.backendHealth = { status: r.status, url, error: '' };
+            } catch (err) {
+              const errorText = String(err?.message || err || 'network_error');
+              this.backendUnavailable = true;
+              this.backendHealth = { status: 'network_error', url, error: errorText };
+              if (this.debugMode) console.error('[DEBUG_HEALTH]', { url, error: errorText, stack: err?.stack || '' });
+            }
+          },
           async loadCategories() {
-            const url = `${API_BASE}/api/categories`;
+            const url = apiUrl('/api/categories');
             try {
               const r = await fetch(url);
               const data = await r.json();
               if (r.ok && Array.isArray(data.categories)) {
                 this.availableCategories = data.categories.map((c) => String(c).trim()).filter(Boolean);
-                this.lastCategoriesFetch = { status: r.status, url, error: '' };
+                this.lastCategoriesFetch = { status: r.status, url, error: '', stack: '' };
                 console.log('[CAT_DEBUG]', 'categories loaded', this.availableCategories.length);
               } else {
                 this.availableCategories = [];
-                this.lastCategoriesFetch = { status: r.status, url, error: 'invalid_payload' };
+                this.lastCategoriesFetch = { status: r.status, url, error: 'invalid_payload', stack: '' };
                 this.manualCategoriesError = `No se pudieron cargar categorías (HTTP ${r.status}).`;
               }
             } catch (err) {
               this.availableCategories = [];
-              this.lastCategoriesFetch = { status: 'network_error', url, error: String(err?.message || err || 'network_error') };
+              const errorText = String(err?.message || err || 'network_error');
+              const stackText = String(err?.stack || '');
+              this.lastCategoriesFetch = { status: 'network_error', url, error: errorText, stack: stackText };
               this.manualCategoriesError = 'No se pudieron cargar categorías (HTTP network_error).';
+              if (this.debugMode) console.error('[DEBUG_CATEGORIES_FETCH]', { url, error: errorText, stack: stackText });
             }
           },
           onOutsideClick(event) {
@@ -368,7 +404,23 @@
           },
           buildPayload(q) {
             const manual = this.selectedManualCategories.join('+');
-            return { message: q, debug: this.debugMode, pipeline: this.settings, manual_categories: manual };
+            const payload = {
+              message: q,
+              debug: this.debugMode,
+              pipeline: {
+                use_picker: !!this.settings.use_picker,
+                use_confirmer: !!this.settings.use_confirmer,
+                use_refiner: !!this.settings.use_refiner,
+                max_categories: Number(this.settings.max_categories),
+                top_k: Number(this.settings.top_k),
+                timeouts: {
+                  total_s: Number(this.settings.timeouts.total_s),
+                },
+              },
+            };
+            if (!this.settings.use_picker || manual) payload.manual_categories = manual;
+            if (this.debugMode) console.log('[DEBUG_CHAT_PAYLOAD]', JSON.stringify(payload));
+            return payload;
           },
           async sendQuestion() {
             const q = this.question.trim();
@@ -395,7 +447,9 @@
                 this.currentStageLabel = stageSteps[idx];
               }, 5000);
 
-              const r = await fetch(`${API_BASE}/api/chat`, {
+              const chatUrl = apiUrl('/api/chat');
+              if (this.debugMode) console.log('[DEBUG_CHAT_URL]', chatUrl);
+              const r = await fetch(chatUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
@@ -436,7 +490,7 @@
             form.append('author', this.author);
             form.append('tags', this.tags);
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', `${API_BASE}/api/upload`);
+            xhr.open('POST', apiUrl('/api/upload'));
             xhr.upload.onprogress = (e) => { if (e.lengthComputable) this.uploadProgress = Math.round((e.loaded / e.total) * 100); };
             xhr.onload = () => {
               this.loadingUpload = false;
