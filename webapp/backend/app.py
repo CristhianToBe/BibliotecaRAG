@@ -268,12 +268,14 @@ async def chat(request: Request):
             effective_use_picker = True
 
         raw_top_level_manual_categories = getattr(req, "manual_categories", None)
-        raw_pipeline_manual_categories = req.pipeline.manual_categories if req.pipeline is not None else None
         top_level_manual_categories = _normalize_manual_categories(raw_top_level_manual_categories)
-        pipeline_manual_categories = _normalize_manual_categories(raw_pipeline_manual_categories)
-        effective_manual_categories = top_level_manual_categories or pipeline_manual_categories
+        effective_manual_categories = top_level_manual_categories
 
         if req.debug:
+            print("[DEBUG] chat payload snapshot", {
+                "pipeline": req.pipeline.model_dump() if req.pipeline else None,
+                "manual_categories": raw_top_level_manual_categories,
+            })
             print(f"[DEBUG] minimum_check effective_use_picker={effective_use_picker} manual_count={len(effective_manual_categories)}")
 
         if (not req.continue_from) and (not effective_use_picker) and (len(effective_manual_categories) == 0):
@@ -319,23 +321,6 @@ async def chat(request: Request):
             pipeline=pipeline_payload,
             manual_categories=payload.get("manual_categories"),
         )
-
-        if result.get("error") == "missing_minimum":
-            content = {
-                "error": "missing_minimum",
-                "details": "Debes activar Picker o indicar categorías manuales.",
-                "trace_id": trace_id,
-            }
-            if req.debug:
-                content["debug_received"] = {
-                    "received_pipeline": req.pipeline.model_dump(),
-                    "received_manual_categories": req.manual_categories,
-                    "raw_keys": list(req.model_dump().keys()),
-                }
-            return JSONResponse(
-                status_code=400,
-                content=content,
-            )
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
         summary = telemetry.summary()
