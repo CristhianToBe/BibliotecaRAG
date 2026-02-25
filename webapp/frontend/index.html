@@ -34,12 +34,19 @@
       .ok { color: #176b2f; }
       .err { color: #b42318; }
       .autocomplete-wrap { position: relative; }
+      .input-with-action { display: flex; gap: 8px; align-items: center; }
+      .input-with-action input { flex: 1; }
+      .debug-btn { width: auto; white-space: nowrap; padding: 8px 10px; font-size: 12px; }
       .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
       .chip { display: inline-flex; align-items: center; gap: 6px; background: #e7f0ff; color: #0b5394; border-radius: 999px; padding: 4px 8px; font-size: 12px; }
       .chip button { width: auto; min-width: auto; padding: 0; border: none; background: transparent; color: #0b5394; cursor: pointer; font-size: 14px; line-height: 1; }
-      .suggestions { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 10; max-height: 180px; overflow: auto; background: #fff; border: 1px solid #ccd; border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); margin: 0; padding: 4px 0; list-style: none; }
+      .suggestions { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 9999; max-height: 180px; overflow: auto; background: #fff; border: 1px solid #ccd; border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); margin: 0; padding: 4px 0; list-style: none; pointer-events: auto; }
       .suggestions li { padding: 8px 10px; cursor: pointer; font-size: 13px; }
       .suggestions li.active, .suggestions li:hover { background: #eaf1ff; }
+      .debug-panel { margin-top: 8px; border: 1px solid #ccd; background: #f6f9ff; border-radius: 8px; padding: 10px; font-size: 12px; }
+      .debug-panel h4 { margin: 0 0 6px 0; font-size: 12px; color: #234; }
+      .debug-grid { display: grid; grid-template-columns: 170px 1fr; gap: 4px 8px; }
+      .debug-grid code { white-space: pre-wrap; word-break: break-word; }
       @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     </style>
   </head>
@@ -85,20 +92,26 @@
           <div class="row">
             <label class="small">Categorías manuales (+)</label>
             <div class="autocomplete-wrap">
-              <input
-                ref="manualCategoryInput"
-                :disabled="settings.use_picker"
-                v-model="manualCategoryQuery"
-                placeholder="Escribe para filtrar categorías"
-                @focus="showSuggestions = true"
-                @keydown="onCategoryInputKeydown"
-              />
+              <div class="input-with-action">
+                <input
+                  ref="manualCategoryInput"
+                  :disabled="settings.use_picker"
+                  v-model="manualCategoryQuery"
+                  placeholder="Escribe para filtrar categorías"
+                  @focus="onCategoryInputFocus"
+                  @blur="onCategoryInputBlur"
+                  @input="onCategoryInput"
+                  @keydown="onCategoryInputKeydown"
+                />
+                <button v-if="debugMode" type="button" class="debug-btn" :disabled="settings.use_picker" @click="runCategoryTest">Test</button>
+              </div>
               <ul class="suggestions" v-if="showSuggestions && filteredCategorySuggestions.length && !settings.use_picker">
                 <li
                   v-for="(category, idx) in filteredCategorySuggestions"
                   :key="category"
                   :class="{ active: idx === activeSuggestionIndex }"
-                  @mousedown.prevent="selectManualCategory(category)"
+                  @mousedown.prevent="onSuggestionMouseDown($event, category)"
+                  @click="onSuggestionClick($event, category)"
                 >
                   {{ category }}
                 </li>
@@ -111,6 +124,19 @@
               </span>
             </div>
             <div class="small err" v-if="manualCategoriesError">{{ manualCategoriesError }}</div>
+            <div class="debug-panel" v-if="debugMode && !settings.use_picker">
+              <h4>Debug panel</h4>
+              <div class="debug-grid">
+                <strong>categoriesLoaded:</strong><code>{{ availableCategories.length }}</code>
+                <strong>lastCategoriesFetch:</strong><code>{{ JSON.stringify(lastCategoriesFetch) }}</code>
+                <strong>dropdownOpen:</strong><code>{{ showSuggestions }}</code>
+                <strong>inputValue:</strong><code>{{ manualCategoryQuery }}</code>
+                <strong>filteredCount:</strong><code>{{ filteredCategorySuggestions.length }}</code>
+                <strong>highlightedIndex:</strong><code>{{ activeSuggestionIndex }}</code>
+                <strong>selectedChips:</strong><code>{{ selectedManualCategories.length }} · {{ JSON.stringify(selectedManualCategories.slice(0, 5)) }}</code>
+                <strong>lastEvent:</strong><code>{{ JSON.stringify(lastCategoryEvent) }}</code>
+              </div>
+            </div>
           </div>
 
           <hr />
@@ -146,6 +172,10 @@
             showSuggestions: false,
             activeSuggestionIndex: -1,
             manualCategoriesError: "",
+            blurCloseTimeout: null,
+            pendingSuggestionClick: false,
+            lastCategoriesFetch: { status: 'idle', url: `${API_BASE}/api/categories`, error: '' },
+            lastCategoryEvent: null,
             settings: {
               use_picker: true,
               use_confirmer: false,
@@ -187,7 +217,7 @@
             return this.availableCategories
               .filter((cat) => cat.toLowerCase().includes(query))
               .filter((cat) => !selected.has(cat.toLowerCase()))
-              .slice(0, 12);
+              .slice(0, 10);
           },
         },
         mounted() {
@@ -198,20 +228,63 @@
           document.removeEventListener('click', this.onOutsideClick);
         },
         methods: {
+          categoryDebug(type, event) {
+            const target = event?.target;
+            const payload = {
+              type,
+              target: target ? `${target.tagName || ''}.${target.className || ''}` : '-',
+              timestamp: new Date().toISOString(),
+            };
+            this.lastCategoryEvent = payload;
+            console.log('[CAT_DEBUG]', payload);
+          },
           async loadCategories() {
+            const url = `${API_BASE}/api/categories`;
             try {
-              const r = await fetch(`${API_BASE}/api/categories`);
+              const r = await fetch(url);
               const data = await r.json();
               if (r.ok && Array.isArray(data.categories)) {
                 this.availableCategories = data.categories.map((c) => String(c).trim()).filter(Boolean);
+                this.lastCategoriesFetch = { status: r.status, url, error: '' };
+                console.log('[CAT_DEBUG]', 'categories loaded', this.availableCategories.length);
+              } else {
+                this.availableCategories = [];
+                this.lastCategoriesFetch = { status: r.status, url, error: 'invalid_payload' };
+                this.manualCategoriesError = `No se pudieron cargar categorías (HTTP ${r.status}).`;
               }
-            } catch (_) {}
+            } catch (err) {
+              this.availableCategories = [];
+              this.lastCategoriesFetch = { status: 'network_error', url, error: String(err?.message || err || 'network_error') };
+              this.manualCategoriesError = 'No se pudieron cargar categorías (HTTP network_error).';
+            }
           },
           onOutsideClick(event) {
             if (!this.$el.contains(event.target)) this.showSuggestions = false;
           },
+          onCategoryInputFocus(event) {
+            this.categoryDebug('focus', event);
+            if (this.blurCloseTimeout) {
+              clearTimeout(this.blurCloseTimeout);
+              this.blurCloseTimeout = null;
+            }
+            this.showSuggestions = true;
+          },
+          onCategoryInputBlur(event) {
+            this.categoryDebug('blur', event);
+            if (this.blurCloseTimeout) clearTimeout(this.blurCloseTimeout);
+            this.blurCloseTimeout = setTimeout(() => {
+              if (this.pendingSuggestionClick) return;
+              const relatedInside = event?.relatedTarget && this.$el.contains(event.relatedTarget);
+              if (!relatedInside) this.showSuggestions = false;
+            }, 150);
+          },
+          onCategoryInput(event) {
+            this.categoryDebug('input', event);
+            this.showSuggestions = true;
+          },
           onCategoryInputKeydown(event) {
             if (this.settings.use_picker) return;
+            this.categoryDebug(`keydown:${event.key}`, event);
             if (event.key === 'Backspace' && !this.manualCategoryQuery && this.selectedManualCategories.length) {
               this.selectedManualCategories.pop();
               return;
@@ -234,6 +307,16 @@
               this.showSuggestions = false;
             }
           },
+          onSuggestionMouseDown(event, category) {
+            this.categoryDebug('suggestion:mousedown', event);
+            this.pendingSuggestionClick = true;
+            this.selectManualCategory(category);
+          },
+          onSuggestionClick(event, category) {
+            this.categoryDebug('suggestion:click', event);
+            this.pendingSuggestionClick = false;
+            this.selectManualCategory(category);
+          },
           selectManualCategory(category) {
             if (this.settings.use_picker) return;
             const value = String(category || '').trim();
@@ -244,6 +327,14 @@
             this.showSuggestions = false;
             this.activeSuggestionIndex = -1;
             this.manualCategoriesError = '';
+            setTimeout(() => { this.pendingSuggestionClick = false; }, 0);
+          },
+          runCategoryTest() {
+            this.manualCategoryQuery = 'da';
+            this.showSuggestions = !this.showSuggestions;
+            this.activeSuggestionIndex = this.filteredCategorySuggestions.length ? 0 : -1;
+            this.categoryDebug('debug:test_button', { target: this.$refs.manualCategoryInput });
+            console.log('[CAT_DEBUG]', 'test suggestions', this.filteredCategorySuggestions.slice(0, 10));
           },
           removeManualCategory(category) {
             this.selectedManualCategories = this.selectedManualCategories.filter((item) => item !== category);

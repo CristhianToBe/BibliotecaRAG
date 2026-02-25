@@ -120,10 +120,21 @@ frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
 def health() -> dict:
     cfg = default_config()
     max_bytes = _max_upload_bytes()
+    categories_count = 0
+    categories_endpoint_ok = False
+    try:
+        categories_payload = list_categories()
+        categories_count = len(categories_payload.get("categories", []))
+        categories_endpoint_ok = isinstance(categories_payload.get("categories"), list)
+    except Exception:
+        categories_endpoint_ok = False
+
     return {
         "ok": True,
         "manifest_path": str(cfg.manifest_path),
         "library_dir": str(cfg.library_dir),
+        "categories_count": categories_count,
+        "categories_endpoint_ok": categories_endpoint_ok,
         "upload": {
             "allowed_exts": sorted(_allowed_upload_exts()),
             "max_upload_bytes": max_bytes,
