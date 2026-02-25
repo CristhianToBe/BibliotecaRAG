@@ -33,6 +33,13 @@
       .progress > div { height: 100%; background: #1f6feb; transition: width 0.2s; }
       .ok { color: #176b2f; }
       .err { color: #b42318; }
+      .autocomplete-wrap { position: relative; }
+      .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+      .chip { display: inline-flex; align-items: center; gap: 6px; background: #e7f0ff; color: #0b5394; border-radius: 999px; padding: 4px 8px; font-size: 12px; }
+      .chip button { width: auto; min-width: auto; padding: 0; border: none; background: transparent; color: #0b5394; cursor: pointer; font-size: 14px; line-height: 1; }
+      .suggestions { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 10; max-height: 180px; overflow: auto; background: #fff; border: 1px solid #ccd; border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); margin: 0; padding: 4px 0; list-style: none; }
+      .suggestions li { padding: 8px 10px; cursor: pointer; font-size: 13px; }
+      .suggestions li.active, .suggestions li:hover { background: #eaf1ff; }
       @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     </style>
   </head>
@@ -75,7 +82,36 @@
           <div class="row"><label class="small">Max categorías</label><input type="number" min="1" max="3" v-model.number="settings.max_categories" /></div>
           <div class="row"><label class="small">Top-K</label><input type="number" min="1" max="30" v-model.number="settings.top_k" /></div>
           <div class="row"><label class="small">Timeout total (s)</label><input type="number" min="5" max="600" v-model.number="settings.timeouts.total_s" /></div>
-          <div class="row"><label class="small">Categorías manuales (coma)</label><input :disabled="settings.use_picker" v-model="manualCategoriesRaw" placeholder="laboral, tributario" /></div>
+          <div class="row">
+            <label class="small">Categorías manuales (+)</label>
+            <div class="autocomplete-wrap">
+              <input
+                ref="manualCategoryInput"
+                :disabled="settings.use_picker"
+                v-model="manualCategoryQuery"
+                placeholder="Escribe para filtrar categorías"
+                @focus="showSuggestions = true"
+                @keydown="onCategoryInputKeydown"
+              />
+              <ul class="suggestions" v-if="showSuggestions && filteredCategorySuggestions.length && !settings.use_picker">
+                <li
+                  v-for="(category, idx) in filteredCategorySuggestions"
+                  :key="category"
+                  :class="{ active: idx === activeSuggestionIndex }"
+                  @mousedown.prevent="selectManualCategory(category)"
+                >
+                  {{ category }}
+                </li>
+              </ul>
+            </div>
+            <div class="chips" v-if="selectedManualCategories.length">
+              <span class="chip" v-for="category in selectedManualCategories" :key="category">
+                {{ category }}
+                <button type="button" @click="removeManualCategory(category)" :disabled="settings.use_picker">×</button>
+              </span>
+            </div>
+            <div class="small err" v-if="manualCategoriesError">{{ manualCategoriesError }}</div>
+          </div>
 
           <hr />
           <h2>Upload</h2>
@@ -104,7 +140,12 @@
             currentStageLabel: "iniciando",
             stageTicker: null,
             multiCategory: true,
-            manualCategoriesRaw: "",
+            manualCategoryQuery: "",
+            availableCategories: [],
+            selectedManualCategories: [],
+            showSuggestions: false,
+            activeSuggestionIndex: -1,
+            manualCategoriesError: "",
             settings: {
               use_picker: true,
               use_confirmer: false,
@@ -128,8 +169,85 @@
           multiCategory(v) {
             if (!v && this.settings.max_categories > 1) this.settings.max_categories = 1;
           },
+          "settings.use_picker"(isOn) {
+            if (isOn) {
+              this.showSuggestions = false;
+              this.manualCategoriesError = "";
+            }
+          },
+          manualCategoryQuery() {
+            this.activeSuggestionIndex = this.filteredCategorySuggestions.length ? 0 : -1;
+          },
+        },
+        computed: {
+          filteredCategorySuggestions() {
+            const query = this.manualCategoryQuery.trim().toLowerCase();
+            if (!query) return [];
+            const selected = new Set(this.selectedManualCategories.map((cat) => cat.toLowerCase()));
+            return this.availableCategories
+              .filter((cat) => cat.toLowerCase().includes(query))
+              .filter((cat) => !selected.has(cat.toLowerCase()))
+              .slice(0, 12);
+          },
+        },
+        mounted() {
+          document.addEventListener('click', this.onOutsideClick);
+          this.loadCategories();
+        },
+        unmounted() {
+          document.removeEventListener('click', this.onOutsideClick);
         },
         methods: {
+          async loadCategories() {
+            try {
+              const r = await fetch(`${API_BASE}/api/categories`);
+              const data = await r.json();
+              if (r.ok && Array.isArray(data.categories)) {
+                this.availableCategories = data.categories.map((c) => String(c).trim()).filter(Boolean);
+              }
+            } catch (_) {}
+          },
+          onOutsideClick(event) {
+            if (!this.$el.contains(event.target)) this.showSuggestions = false;
+          },
+          onCategoryInputKeydown(event) {
+            if (this.settings.use_picker) return;
+            if (event.key === 'Backspace' && !this.manualCategoryQuery && this.selectedManualCategories.length) {
+              this.selectedManualCategories.pop();
+              return;
+            }
+            const options = this.filteredCategorySuggestions;
+            if (!options.length) return;
+            if (event.key === 'ArrowDown') {
+              event.preventDefault();
+              this.showSuggestions = true;
+              this.activeSuggestionIndex = (this.activeSuggestionIndex + 1 + options.length) % options.length;
+            } else if (event.key === 'ArrowUp') {
+              event.preventDefault();
+              this.showSuggestions = true;
+              this.activeSuggestionIndex = (this.activeSuggestionIndex - 1 + options.length) % options.length;
+            } else if (event.key === 'Enter') {
+              event.preventDefault();
+              const selected = options[Math.max(0, this.activeSuggestionIndex)];
+              if (selected) this.selectManualCategory(selected);
+            } else if (event.key === 'Escape') {
+              this.showSuggestions = false;
+            }
+          },
+          selectManualCategory(category) {
+            if (this.settings.use_picker) return;
+            const value = String(category || '').trim();
+            if (!value) return;
+            const exists = this.selectedManualCategories.some((item) => item.toLowerCase() === value.toLowerCase());
+            if (!exists) this.selectedManualCategories.push(value);
+            this.manualCategoryQuery = '';
+            this.showSuggestions = false;
+            this.activeSuggestionIndex = -1;
+            this.manualCategoriesError = '';
+          },
+          removeManualCategory(category) {
+            this.selectedManualCategories = this.selectedManualCategories.filter((item) => item !== category);
+          },
           applyFastMode() {
             this.settings.use_confirmer = false;
             this.settings.use_refiner = false;
@@ -158,12 +276,17 @@
             });
           },
           buildPayload(q) {
-            const manual = this.manualCategoriesRaw.split(',').map((x) => x.trim()).filter(Boolean);
+            const manual = this.selectedManualCategories.join('+');
             return { message: q, debug: this.debugMode, pipeline: this.settings, manual_categories: manual };
           },
           async sendQuestion() {
             const q = this.question.trim();
             if (!q || this.loadingChat) return;
+            if (!this.settings.use_picker && this.selectedManualCategories.length === 0) {
+              this.manualCategoriesError = 'Cuando el Picker está apagado, selecciona al menos una categoría manual.';
+              return;
+            }
+            this.manualCategoriesError = '';
             this.messages.push({ role: 'you', text: q });
             this.question = '';
             this.loadingChat = true;
