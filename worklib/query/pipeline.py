@@ -281,7 +281,7 @@ def _retrieve_by_category(
         trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
         if not vs_id:
             if debug:
-                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": 0.0, "hits_count": 0, "timed_out": False, "reason": "missing_vs"})
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": 0.0, "hits_count": 0, "reason": "missing_vs"})
             if telemetry:
                 telemetry.mark_retrieval_category(cname, 0.0, "missing_vs")
             return []
@@ -305,10 +305,10 @@ def _retrieve_by_category(
         if elapsed > retrieve_timeout_s:
             status = "timeout"
             if debug:
-                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "timed_out": True, "reason": "timeout"})
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": "timeout"})
             return []
         if debug:
-            print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "timed_out": status == "timeout", "reason": status})
+            print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": status})
         if telemetry:
             telemetry.mark_retrieval_category(cname, elapsed, status)
         return out
@@ -396,7 +396,6 @@ def run_pipeline_resilient(
     pipeline: Optional[Dict[str, Any]] = None,
     manual_categories: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    started = time.perf_counter()
     opts = _coerce_pipeline_options(pipeline)
     warnings: List[str] = []
     degrade_steps: List[str] = []
@@ -417,38 +416,25 @@ def run_pipeline_resilient(
         base.update(payload)
         print(f"[DEBUG] {label}", base)
 
-    def _stage_begin(stage_name: str, *, stage_budget_s: Optional[float], skipped: bool = False, reason: str = "") -> float:
+    def _stage_begin(stage_name: str, *, skipped: bool = False, reason: str = "") -> float:
         t0 = time.perf_counter()
         _debug_log("STAGE_BEGIN", {
             "stage_name": stage_name,
             "start_ts": t0,
-            "stage_budget_s": stage_budget_s,
             "skipped": skipped,
             "reason": reason,
         })
         return t0
 
-    def _stage_end(
-        stage_name: str,
-        *,
-        started_at: float,
-        stage_budget_s: Optional[float],
-        skipped: bool = False,
-        degraded: bool = False,
-        timed_out: bool = False,
-        reason: str = "",
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    def _stage_end(stage_name: str, *, started_at: float, skipped: bool = False, degraded: bool = False, reason: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
         t1 = time.perf_counter()
         payload: Dict[str, Any] = {
             "stage_name": stage_name,
             "start_ts": started_at,
             "end_ts": t1,
             "elapsed_ms": round((t1 - started_at) * 1000, 2),
-            "stage_budget_s": stage_budget_s,
             "skipped": skipped,
             "degraded": degraded,
-            "timed_out": timed_out,
             "reason": reason,
         }
         if extra:
@@ -456,214 +442,68 @@ def run_pipeline_resilient(
         debug_pipeline["stages"][stage_name] = payload
         _debug_log("STAGE_END", payload)
 
-    def _run_stage_with_timeout(
-        stage_name: str,
-        budget_s: float,
-        fn: Callable[[], Any],
-        fallback: Any,
-        *,
-        timeout_grace_ms: int = 0,
-        allow_debug_late_output: bool = False,
-    ) -> Tuple[Any, bool, float, int, str]:
-        s0 = _stage_begin(stage_name, stage_budget_s=budget_s)
+    def _run_stage(stage_name: str, fn: Callable[[], Any], fallback: Any) -> Tuple[Any, str]:
+        started_at = _stage_begin(stage_name)
         calls_before = telemetry.model_calls if telemetry else 0
-        task_meta: Dict[str, Optional[float]] = {"started_at": None, "finished_at": None}
-
-        def _thread_fn() -> Any:
+        task_started = time.perf_counter()
+        result_used = "stage_output"
+        try:
             tele_token = set_telemetry(telemetry)
             stage_token = set_current_stage(stage_name)
             debug_token = set_debug_enabled(debug)
-            task_meta["started_at"] = time.perf_counter()
             try:
-                return fn()
+                value = fn()
             finally:
-                task_meta["finished_at"] = time.perf_counter()
                 reset_debug_enabled(debug_token)
                 reset_current_stage(stage_token)
                 reset_telemetry(tele_token)
-
-        ex = ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(_thread_fn)
-        timeout_state = {"timed_out": False}
-        stage_state = {"result_used": "pending"}
-
-        if debug:
-            def _on_done(_fut):
-                started_at = task_meta.get("started_at")
-                finished_at = task_meta.get("finished_at")
-                task_elapsed_ms = round((finished_at - started_at) * 1000, 2) if (started_at and finished_at) else None
-                if stage_name in debug_pipeline["stages"]:
-                    debug_pipeline["stages"][stage_name]["task_elapsed_ms"] = task_elapsed_ms
-                if timeout_state["timed_out"]:
-                    _debug_log("STAGE_TASK_COMPLETED_LATE", {
-                        "stage_name": stage_name,
-                        "task_elapsed_ms": task_elapsed_ms,
-                        "used_or_discarded": stage_state.get("result_used", "pending"),
-                    })
-            fut.add_done_callback(_on_done)
-
-        timed_out = False
-        stage_result_used = "stage_output"
-        stage_state["result_used"] = stage_result_used
-        timeout_budget = max(0.1, budget_s + (timeout_grace_ms / 1000.0))
-        try:
-            value = fut.result(timeout=timeout_budget)
-        except FuturesTimeoutError:
-            timeout_state["timed_out"] = True
-            timed_out = True
-            value = fallback
-            stage_result_used = "fallback"
-            stage_state["result_used"] = stage_result_used
-            _debug_log("STAGE_TIMEOUT", {
-                "stage_name": stage_name,
-                "budget_s": budget_s,
-                "elapsed_ms": round((time.perf_counter() - s0) * 1000, 2),
-            })
-            if debug and allow_debug_late_output:
-                try:
-                    late_value = fut.result(timeout=LATE_RESULT_GRACE_S)
-                    value = late_value
-                    timed_out = False
-                    stage_result_used = "late_output_used"
-                    stage_state["result_used"] = stage_result_used
-                    warnings.append(f"Se usó salida tardía de {stage_name} en modo debug.")
-                    _debug_log("STAGE_LATE_RESULT_POLICY", {
-                        "stage_name": stage_name,
-                        "used": True,
-                        "reason": "late_output_within_debug_grace",
-                    })
-                except Exception:
-                    cancelled = fut.cancel()
-                    _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled, "state": "done" if fut.done() else ("running" if fut.running() else "pending")})
-                    stage_state["result_used"] = "discarded"
-                    _debug_log("STAGE_LATE_RESULT_POLICY", {
-                        "stage_name": stage_name,
-                        "used": False,
-                        "reason": "late_output_not_available_within_grace",
-                    })
-            else:
-                stage_state["result_used"] = "discarded"
-                cancelled = fut.cancel()
-                _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled, "state": "done" if fut.done() else ("running" if fut.running() else "pending")})
         except Exception as exc:
             value = fallback
-            stage_result_used = "fallback"
-            stage_state["result_used"] = stage_result_used
+            result_used = "fallback"
+            warnings.append(f"Fallo en etapa {stage_name}: {type(exc).__name__}")
             _debug_log("STAGE_ERROR", {"stage_name": stage_name, "error": str(exc)})
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
-
-        elapsed_s = max(0.0, time.perf_counter() - s0)
-        elapsed_ms = round(elapsed_s * 1000, 2)
-        budget_ms = round(budget_s * 1000, 2)
-        started_at = task_meta.get("started_at")
-        finished_at = task_meta.get("finished_at")
-        task_elapsed_ms = round((finished_at - started_at) * 1000, 2) if (started_at and finished_at) else None
-        if timeout_grace_ms > 0 and (elapsed_ms > budget_ms) and (elapsed_ms <= budget_ms + timeout_grace_ms) and not timed_out:
-            _debug_log("TIMEOUT_GRACE_APPLIED", {
-                "stage_name": stage_name,
-                "budget_ms": budget_ms,
-                "elapsed_ms": elapsed_ms,
-                "grace_ms": timeout_grace_ms,
-            })
-
+        task_elapsed_s = max(0.0, time.perf_counter() - task_started)
         if telemetry:
-            telemetry.mark_stage(stage_name, elapsed_s)
+            telemetry.mark_stage(stage_name, task_elapsed_s)
         calls_after = telemetry.model_calls if telemetry else calls_before
         _stage_end(
             stage_name,
-            started_at=s0,
-            stage_budget_s=budget_s,
-            timed_out=timed_out,
-            reason="timeout" if timed_out else "ok",
+            started_at=started_at,
+            reason="ok" if result_used == "stage_output" else "fallback_exception",
             extra={
-                "timeout_policy": f"future.result(timeout=budget+grace={timeout_budget:.3f}s)",
                 "llm_calls_made": max(0, calls_after - calls_before),
-                "stage_result_used": stage_result_used,
-                "task_elapsed_ms": task_elapsed_ms,
+                "stage_result_used": result_used,
+                "task_elapsed_ms": round(task_elapsed_s * 1000, 2),
             },
         )
-        return value, timed_out, elapsed_s, max(0, calls_after - calls_before), stage_result_used
+        return value, result_used
 
     if not opts.use_picker and not manual_categories:
-        out = {
-            "error": "missing_minimum",
-            "details": "Debes activar Picker o indicar categorías manuales.",
-        }
+        out = {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales."}
         if debug:
-            out["debug_picker"] = {
-                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-                "picked_curr": {},
-                "selected_categories": [],
-            }
+            out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": {}, "selected_categories": []}
             out["debug_pipeline"] = debug_pipeline
         return out
-
-    def _elapsed_s() -> float:
-        return max(0.0, time.perf_counter() - started)
-
-    reserved_write_s = min(opts.timeouts.write_s, max(1.0, opts.timeouts.total_s / 2))
-
-    def _remaining_s() -> float:
-        return max(0.0, opts.timeouts.total_s - _elapsed_s())
-
-    def _remaining_prewrite_s() -> float:
-        return max(0.0, opts.timeouts.total_s - reserved_write_s - _elapsed_s())
-
-    def _degrade_once(reason: str) -> bool:
-        if opts.use_confirmer:
-            opts.use_confirmer = False
-            msg = f"Se desactivó confirmer por tiempo ({reason})."
-        elif opts.use_refiner:
-            opts.use_refiner = False
-            msg = f"Se desactivó refiner por tiempo ({reason})."
-        elif opts.max_categories > 1:
-            opts.max_categories = 1
-            msg = f"Se redujo max_categories a 1 por tiempo ({reason})."
-        elif opts.top_k > 4 or opts.max_context_chars > 6000:
-            opts.top_k = min(opts.top_k, 4)
-            opts.max_context_chars = min(opts.max_context_chars, 6000)
-            msg = f"Se redujeron top_k/contexto por tiempo ({reason})."
-        else:
-            return False
-        warnings.append(msg)
-        degrade_steps.append(msg)
-        return True
-
-    if _remaining_prewrite_s() < 5 and not _degrade_once("presupuesto crítico inicial"):
-        warnings.append("Presupuesto de tiempo extremadamente bajo.")
 
     selected_categories: List[str] = []
     picked_curr: Dict[str, Any] = {}
     pick_ttl_s = _env_float("WEBAPP_PICK_CACHE_TTL_S", 600)
 
     if opts.use_picker:
-        pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_prewrite_s() - 2))
         _debug_log("PICK_INPUT_SUMMARY", {
             "user_len": len(question or ""),
             "model": os.getenv("MODEL_PICK", "gpt-5-nano"),
             "valid_set_len": len(valid_set),
-            "budget_s": pick_timeout,
         })
-        pick_result, pick_timed_out, _, _, _ = _run_stage_with_timeout(
-            "pick",
-            pick_timeout,
-            lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, False),
-            ({}, False),
-            timeout_grace_ms=TIMEOUT_GRACE_MS,
-            allow_debug_late_output=True,
-        )
+        pick_result, _ = _run_stage("pick", lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, False), ({}, False))
         picked_curr = pick_result[0] if isinstance(pick_result, tuple) else {}
         raw_selected = picked_curr.get("selected") or []
-
         if debug:
-            membership_map = {c: (c in valid_set) for c in raw_selected}
             _debug_log("PICKER_MATCH", {
                 "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
                 "picked_curr": picked_curr,
-                "membership_map": membership_map,
+                "membership_map": {c: (c in valid_set) for c in raw_selected},
             })
-
         selected_categories = [c for c in raw_selected if c in valid_set][: opts.max_categories]
         if not selected_categories and raw_selected:
             valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
@@ -671,71 +511,40 @@ def run_pipeline_resilient(
             for token in [_top_category_token(c) for c in raw_selected]:
                 expanded.extend([k for k in valid_keys if _top_category_token(k) == token])
             selected_categories = _dedupe_preserve_order(expanded)[: opts.max_categories]
-
-        if pick_timed_out:
-            warnings.append("Picker alcanzó timeout; se aplicó fallback de selección.")
-            if not selected_categories:
-                valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
-                selected_categories = _fallback_pick_categories(question, valid_keys, opts.max_categories)
-                if selected_categories:
-                    _debug_log("PICK_FALLBACK_USED", {
-                        "strategy": "heuristic_defaults",
-                        "selected_categories": selected_categories,
-                    })
         if not selected_categories:
-            warnings.append("Picker no devolvió categorías válidas; se intentarán categorías manuales.")
+            valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
+            selected_categories = _fallback_pick_categories(question, valid_keys, opts.max_categories)
+            if selected_categories:
+                _debug_log("PICK_FALLBACK_USED", {"strategy": "heuristic_defaults", "selected_categories": selected_categories})
     else:
-        s = _stage_begin("pick", stage_budget_s=opts.timeouts.pick_s, skipped=True, reason="disabled")
+        s0 = _stage_begin("pick", skipped=True, reason="disabled")
         if telemetry:
             telemetry.mark_stage("pick", 0.0)
-        _stage_end("pick", started_at=s, stage_budget_s=opts.timeouts.pick_s, skipped=True, reason="disabled")
+        _stage_end("pick", started_at=s0, skipped=True, reason="disabled")
 
     if not selected_categories and manual_categories:
         selected_categories = [c for c in manual_categories if c in valid_set][: opts.max_categories]
 
     if not selected_categories:
-        out = {
-            "error": "missing_minimum",
-            "details": "Debes activar Picker o indicar categorías manuales.",
-        }
+        out = {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales."}
         if debug:
-            out["debug_picker"] = {
-                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-                "picked_curr": picked_curr,
-                "selected_categories": selected_categories,
-            }
+            out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": picked_curr, "selected_categories": selected_categories}
             out["debug_pipeline"] = debug_pipeline
         return out
 
     confirm_data: Dict[str, Any] = {}
     if opts.use_confirmer and selected_categories:
-        confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_prewrite_s() - 2))
-        confirm_data, confirm_timed_out, confirm_elapsed_s, confirm_calls, confirm_result_used = _run_stage_with_timeout(
+        confirm_data, _ = _run_stage(
             "confirm",
-            confirm_timeout,
             lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=False, debug=False),
-            {"categories_final": selected_categories, "suggested_categories": selected_categories, "_timeout": True},
-            timeout_grace_ms=TIMEOUT_GRACE_MS,
-            allow_debug_late_output=True,
+            {"categories_final": selected_categories, "suggested_categories": selected_categories},
         )
-        _debug_log("CONFIRM_TIMEOUT_DIAGNOSTICS", {
-            "confirm_budget_s": confirm_timeout,
-            "confirm_elapsed_ms": round(confirm_elapsed_s * 1000, 2),
-            "confirm_llm_calls": confirm_calls,
-            "confirm_timeout_flag": bool(confirm_timed_out or confirm_data.get("_timeout")),
-            "confirm_used_output": confirm_result_used,
-        })
-        if confirm_data.get("_timeout"):
-            _degrade_once("timeout en confirmer")
         selected_categories = [c for c in (confirm_data.get("categories_final") or confirm_data.get("suggested_categories") or selected_categories) if c in valid_set][: opts.max_categories]
     else:
-        s = _stage_begin("confirm", stage_budget_s=opts.timeouts.confirm_s, skipped=True, reason="disabled_or_no_categories")
+        s0 = _stage_begin("confirm", skipped=True, reason="disabled_or_no_categories")
         if telemetry:
             telemetry.mark_stage("confirm", 0.0)
-        _stage_end("confirm", started_at=s, stage_budget_s=opts.timeouts.confirm_s, skipped=True, reason="disabled_or_no_categories")
-
-    while _remaining_prewrite_s() < 8 and _degrade_once("presupuesto crítico"):
-        pass
+        _stage_end("confirm", started_at=s0, skipped=True, reason="disabled_or_no_categories")
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
@@ -743,31 +552,12 @@ def run_pipeline_resilient(
 
     refiners: List[Dict[str, Any]] = []
     if opts.use_refiner:
-        refine_timeout = min(opts.timeouts.refine_s, max(1.0, _remaining_prewrite_s() - 2))
-        refiners, refine_timed_out, refine_elapsed_s, refine_calls, refine_result_used = _run_stage_with_timeout(
-            "refine",
-            refine_timeout,
-            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False),
-            [],
-            timeout_grace_ms=TIMEOUT_GRACE_MS,
-            allow_debug_late_output=True,
-        )
-        _debug_log("REFINE_TIMEOUT_DIAGNOSTICS", {
-            "refine_budget_s": refine_timeout,
-            "refine_elapsed_ms": round(refine_elapsed_s * 1000, 2),
-            "refine_llm_calls": refine_calls,
-            "refiner_variants_returned": len(refiners or []),
-            "refiner_variant_names": [str(r.get("name") or "") for r in (refiners or [])],
-            "refine_timeout_flag": bool(refine_timed_out),
-            "refine_used_output": refine_result_used,
-        })
-        if not refiners:
-            _degrade_once("timeout en refiner")
+        refiners, _ = _run_stage("refine", lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False), [])
     else:
-        s = _stage_begin("refine", stage_budget_s=opts.timeouts.refine_s, skipped=True, reason="disabled")
+        s0 = _stage_begin("refine", skipped=True, reason="disabled")
         if telemetry:
             telemetry.mark_stage("refine", 0.0)
-        _stage_end("refine", started_at=s, stage_budget_s=opts.timeouts.refine_s, skipped=True, reason="disabled")
+        _stage_end("refine", started_at=s0, skipped=True, reason="disabled")
 
     refined_queries = [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()]
     if refined_queries:
@@ -806,73 +596,40 @@ def run_pipeline_resilient(
     })
 
     if retrieval_cache_hit and cached_hits_count == 0:
-        _debug_log("CACHE_HIT_EMPTY", {
-            "cache_key_sha1": retrieval_key,
-            "action": "treat_as_miss_and_execute_retrieval",
-        })
+        _debug_log("CACHE_HIT_EMPTY", {"cache_key_sha1": retrieval_key, "action": "treat_as_miss_and_execute_retrieval"})
         retrieval_cache_hit = False
         all_hits = None
 
-    if all_hits is None and _remaining_prewrite_s() > 6:
-        retrieve_timeout = min(opts.timeouts.retrieve_per_cat_s, max(1.0, _remaining_prewrite_s() / max(1, len(category_infos))))
+    if all_hits is None:
         _debug_log("RETRIEVAL_EXECUTED", {
             "categories": [x.get("category") for x in category_infos],
             "category_infos": category_infos,
             "queries": [q_final] + [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()],
             "top_k": opts.top_k,
-            "retrieve_timeout_s": retrieve_timeout,
         })
-        all_hits, retrieval_timed_out, retrieval_elapsed_s, _, retrieval_result_used = _run_stage_with_timeout(
+        all_hits, retrieval_result_used = _run_stage(
             "retrieval",
-            retrieve_timeout,
             lambda: _retrieve_by_category(
                 q_final=q_final,
                 refiners=refiners,
                 category_infos=category_infos,
                 max_workers=max_workers,
-                retrieve_timeout_s=retrieve_timeout,
+                retrieve_timeout_s=opts.timeouts.retrieve_per_cat_s,
                 top_k=opts.top_k,
                 debug=debug,
             ),
             [],
-            timeout_grace_ms=TIMEOUT_GRACE_MS,
-            allow_debug_late_output=True,
         )
-        if retrieval_timed_out:
-            _debug_log("RETRIEVAL_TIMEOUT_OBSERVED", {
-                "elapsed_ms": round(retrieval_elapsed_s * 1000, 2),
-                "budget_ms": round(retrieve_timeout * 1000, 2),
-                "stage_result_used": retrieval_result_used,
-            })
-            if not all_hits:
-                warnings.append("Retrieval timed out; se devolvió evidencia parcial o vacía.")
-                degrade_steps.append("Retrieval timed out")
-                all_hits = _retrieve_quick_fallback(
-                    q_final=q_final,
-                    category_infos=category_infos,
-                    top_k=opts.top_k,
-                    max_workers=max_workers,
-                    debug=debug,
-                )
-                _debug_log("RETRIEVAL_FALLBACK_USED", {
-                    "reason": "selector_timeout",
-                    "returned_candidates": len(all_hits or []),
-                })
+        if retrieval_result_used != "stage_output" and not all_hits:
+            all_hits = _retrieve_quick_fallback(q_final=q_final, category_infos=category_infos, top_k=opts.top_k, max_workers=max_workers, debug=debug)
+            _debug_log("RETRIEVAL_FALLBACK_USED", {"reason": "stage_exception", "returned_candidates": len(all_hits or [])})
         _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits or []), _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800))
-    elif all_hits is None:
-        all_hits = []
-        _degrade_once("sin tiempo para retrieval")
-        if telemetry:
-            telemetry.mark_stage("retrieval", 0.0)
-        sret = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="insufficient_remaining_budget")
-        _debug_log("RETRIEVAL_SKIPPED", {"reason": "insufficient_remaining_budget", "remaining_s": _remaining_prewrite_s()})
-        _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, degraded=True, reason="insufficient_remaining_budget", extra={"hits_len": 0})
     else:
+        s0 = _stage_begin("retrieval", skipped=True, reason="cache_hit")
         if telemetry:
             telemetry.mark_stage("retrieval", 0.0)
-        sret = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit")
         _debug_log("RETRIEVAL_SKIPPED", {"reason": "cache_hit", "cached_hits_count": len(all_hits or [])})
-        _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
+        _stage_end("retrieval", started_at=s0, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
 
     all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits or []), library_root=Path(mp).parent)
     all_hits = _shrink_evidence_payload((all_hits or []), max_hits=5, max_per_hit_chars=1200)
@@ -906,42 +663,9 @@ def run_pipeline_resilient(
     if not all_hits:
         warning = "No se recuperó evidencia del repositorio en esta ejecución (0 fragmentos)."
         warnings.append(warning)
-        answer = warning
-        out = {
-            "status": "ok",
-            "answer": answer,
-            "references": [],
-            "selected_categories": selected_categories,
-            "warnings": warnings,
-            "degrade_steps": degrade_steps,
-            "retrieval_cache_hit": retrieval_cache_hit,
-        }
-        if debug:
-            out["debug_picker"] = {
-                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-                "picked_curr": picked_curr,
-                "selected_categories": selected_categories,
-            }
-            out["debug_pipeline"] = debug_pipeline
-            out["debug_pipeline"].update({
-                "picked_curr": picked_curr,
-                "selected_categories": selected_categories,
-                "all_hits_len": len(all_hits or []),
-                "confirm_refine_executed": {
-                    "confirm": bool(debug_pipeline["stages"].get("confirm") and not debug_pipeline["stages"]["confirm"].get("skipped")),
-                    "refine": bool(debug_pipeline["stages"].get("refine") and not debug_pipeline["stages"]["refine"].get("skipped")),
-                },
-            })
-        return out
 
-    write_timeout = max(1.0, opts.timeouts.write_s)
-    answer, writer_timed_out, _, _, writer_result_used = _run_stage_with_timeout(
-        "answer_generation",
-        write_timeout,
-        lambda: write_answer(q_final, all_hits, debug=debug),
-        "",
-    )
-    _debug_log("WRITER_STATUS", {"timed_out": writer_timed_out, "write_budget_s": write_timeout, "writer_result_used": writer_result_used})
+    answer, writer_result_used = _run_stage("answer_generation", lambda: write_answer(q_final, all_hits, debug=debug), "")
+    _debug_log("WRITER_STATUS", {"writer_result_used": writer_result_used})
 
     if debug:
         print("[DEBUG] run_pipeline_resilient answer", {
@@ -966,15 +690,6 @@ def run_pipeline_resilient(
             warnings.append(warning)
             labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
             answer = f"{warning}\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
-        if debug:
-            print("[DEBUG] run_pipeline_resilient fallback", {
-                "trace_id": trace_id,
-                "reason": "answer vacía (mejor esfuerzo)",
-                "answer_len": len(answer),
-                "answer_preview": answer[:220],
-                "warnings": warnings,
-                "degrade_steps": degrade_steps,
-            })
 
     if debug:
         timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
@@ -1005,16 +720,13 @@ def run_pipeline_resilient(
         "retrieval_cache_hit": retrieval_cache_hit,
     }
     if debug:
-        out["debug_picker"] = {
-            "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-            "picked_curr": picked_curr,
-            "selected_categories": selected_categories,
-        }
+        out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": picked_curr, "selected_categories": selected_categories}
         out["debug_pipeline"] = debug_pipeline
         out["debug_pipeline"].update({
             "picked_curr": picked_curr,
             "selected_categories": selected_categories,
             "all_hits_len": len(all_hits or []),
+            "retrieval_degraded": retrieval_degraded,
             "confirm_refine_executed": {
                 "confirm": bool(debug_pipeline["stages"].get("confirm") and not debug_pipeline["stages"]["confirm"].get("skipped")),
                 "refine": bool(debug_pipeline["stages"].get("refine") and not debug_pipeline["stages"]["refine"].get("skipped")),
