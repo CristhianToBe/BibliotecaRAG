@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
-from worklib.query.pipeline import run_after_confirm, run_pick_confirm
+from worklib.query.pipeline import run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
 
 load_dotenv()
@@ -43,12 +41,26 @@ def _upload_dir() -> Path:
     return Path(os.getenv("WEBAPP_UPLOAD_DIR", "uploads")).resolve()
 
 
-def _chat_timeout_seconds() -> float:
-    raw = os.getenv("WEBAPP_CHAT_TIMEOUT_S", os.getenv("WEBAPP_CHAT_TIMEOUT_SECONDS", "90"))
-    try:
-        return max(1.0, float(raw))
-    except Exception:
-        return 90.0
+
+
+
+class PipelineTimeoutsRequest(BaseModel):
+    total_s: float = Field(default=120, ge=5, le=600)
+    pick_s: float = Field(default=10, ge=1, le=120)
+    confirm_s: float = Field(default=10, ge=1, le=120)
+    refine_s: float = Field(default=10, ge=1, le=120)
+    retrieve_per_cat_s: float = Field(default=15, ge=1, le=180)
+    write_s: float = Field(default=45, ge=1, le=180)
+
+
+class PipelineRequest(BaseModel):
+    use_picker: bool = True
+    use_confirmer: bool = False
+    use_refiner: bool = False
+    max_categories: int = Field(default=2, ge=1, le=3)
+    top_k: int = Field(default=8, ge=1, le=30)
+    max_context_chars: int = Field(default=12000, ge=1000, le=30000)
+    timeouts: PipelineTimeoutsRequest = Field(default_factory=PipelineTimeoutsRequest)
 
 
 class ContinueFrom(BaseModel):
@@ -72,6 +84,8 @@ class ChatRequest(BaseModel):
     debug: bool = False
     confirm_glimpse: bool = True
     continue_from: ContinueFrom | None = None
+    pipeline: PipelineRequest = Field(default_factory=PipelineRequest)
+    manual_categories: list[str] = Field(default_factory=list)
 
 
 class UploadResponse(BaseModel):
@@ -115,20 +129,16 @@ def health() -> dict:
     }
 
 
-def _run_chat_job(timeout_s: float, fn) -> dict:
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn)
-        return fut.result(timeout=timeout_s)
 
-
-def _log_trace(summary: dict[str, Any]) -> None:
-    print({
-        "trace_id": summary.get("trace_id"),
-        "timings_ms": summary.get("timings_ms"),
-        "retrieval_ms_by_category": summary.get("retrieval_ms_by_category"),
-        "model_calls": summary.get("model_calls"),
-        "models": summary.get("models"),
-    })
+def _log_trace(summary: dict[str, Any], *, degrade_steps: list[str] | None = None, warnings: list[str] | None = None) -> None:
+    print(
+        "trace_summary",
+        f"trace_id={summary.get('trace_id')}",
+        f"total_ms={summary.get('total_ms')}",
+        f"stages_ms={summary.get('timings_ms')}",
+        f"degrade_steps={degrade_steps or []}",
+        f"warnings={warnings or []}",
+    )
 
 
 @app.post("/api/chat")
@@ -137,136 +147,67 @@ def chat(req: ChatRequest):
     if not question and not req.continue_from:
         return JSONResponse(status_code=400, content={"error": "empty_question", "details": "message o question es requerido"})
 
-    timeout_s = _chat_timeout_seconds()
     trace_id = uuid.uuid4().hex[:12]
     telemetry = RequestTelemetry(trace_id=trace_id)
     token = set_telemetry(telemetry)
 
     try:
-        if req.continue_from and req.continue_from.stage == "confirm_refine":
-            conversation_id = (req.conversation_id or "").strip()
-            if not conversation_id:
-                return JSONResponse(status_code=400, content={"error": "missing_conversation_id", "details": "conversation_id es requerido", "trace_id": trace_id})
-
-            pending = PENDING_CONVERSATIONS.get(conversation_id)
-            if not pending or pending.get("stage") != "confirm_refine":
-                return JSONResponse(status_code=409, content={"error": "invalid_continuation", "details": "No hay estado pendiente para confirm_refine", "trace_id": trace_id})
-
-            base_question = pending.get("last_question") or question
-            selected_categories = req.continue_from.selected_categories or pending.get("selected_categories") or []
-            selector_instruction = req.continue_from.selector_instruction or pending.get("selector_instruction") or ""
-            user_reply = req.continue_from.user_reply or ""
-
-            try:
-                result = _run_chat_job(
-                    timeout_s,
-                    lambda: run_after_confirm(
-                        base_question,
-                        selected_categories=selected_categories,
-                        selector_instruction=selector_instruction,
-                        user_reply=user_reply,
-                        manifest_path=pending.get("manifest_path") or req.manifest_path,
-                        max_workers=req.max_workers,
-                        debug=req.debug,
-                        picked=pending.get("picked"),
-                    ),
-                )
-            except FuturesTimeoutError:
-                result = {
-                    "answer": "Se agotó el tiempo de procesamiento. Te comparto resultados parciales.",
-                    "selected_categories": list(selected_categories),
-                    "references": [],
-                }
-            finally:
-                PENDING_CONVERSATIONS.pop(conversation_id, None)
-
-            payload = {
-                "status": "ok",
-                "trace_id": trace_id,
-                "conversation_id": conversation_id,
-                "answer": str(result.get("answer", "")),
-                "selected_categories": list(result.get("selected_categories", []) or []),
-                "references": list(result.get("references", []) or []),
-            }
-            summary = telemetry.summary()
-            _log_trace(summary)
-            if req.debug:
-                payload["debug_info"] = summary
-            return JSONResponse(status_code=200, content=payload)
-
         conversation_id = (req.conversation_id or uuid.uuid4().hex)
-        try:
-            pre = _run_chat_job(
-                timeout_s,
-                lambda: run_pick_confirm(question, manifest_path=req.manifest_path, debug=req.debug, confirm_glimpse=req.confirm_glimpse),
+
+        if req.continue_from and req.continue_from.stage == "confirm_refine":
+            pending = PENDING_CONVERSATIONS.get(conversation_id)
+            if not pending:
+                return JSONResponse(status_code=409, content={"error": "invalid_continuation", "details": "No hay estado pendiente para confirm_refine", "trace_id": trace_id})
+            payload = {
+                "message": pending.get("last_question") or question,
+                "manifest_path": pending.get("manifest_path") or req.manifest_path,
+                "manual_categories": req.continue_from.selected_categories or pending.get("selected_categories") or [],
+            }
+        else:
+            payload = {
+                "message": question,
+                "manifest_path": req.manifest_path,
+                "manual_categories": req.manual_categories,
+            }
+
+        result = run_pipeline_resilient(
+            payload["message"],
+            manifest_path=payload.get("manifest_path"),
+            max_workers=req.max_workers,
+            debug=req.debug,
+            pipeline=req.pipeline.model_dump(),
+            manual_categories=payload.get("manual_categories"),
+        )
+
+        if result.get("error") == "missing_minimum":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "missing_minimum",
+                    "details": "Debes activar Picker o indicar categorías manuales.",
+                    "trace_id": trace_id,
+                },
             )
-        except FuturesTimeoutError:
-            return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": f"pick/confirm exceeded timeout {timeout_s}s", "trace_id": trace_id})
 
-        confirm = dict(pre.get("confirm") or {})
-        picked = dict(pre.get("picked") or {})
-        selected_categories = list(confirm.get("categories_final") or confirm.get("suggested_categories") or list((picked.get("selected") or [])[:2]))
+        PENDING_CONVERSATIONS.pop(conversation_id, None)
+        summary = telemetry.summary()
+        warnings = list(result.get("warnings", []) or [])
+        degrade_steps = list(result.get("degrade_steps", []) or [])
+        _log_trace(summary, degrade_steps=degrade_steps, warnings=warnings)
 
-        # Confirm REFINE only matters if user follows up; no additional model rounds are executed here.
-        action = str(confirm.get("action") or "PASS").upper()
-        if action == "REFINE" and req.confirm_glimpse:
-            PENDING_CONVERSATIONS[conversation_id] = {
-                "stage": "confirm_refine",
-                "selector_instruction": str(confirm.get("selector_instruction") or ""),
-                "selected_categories": selected_categories,
-                "last_question": question,
-                "manifest_path": pre.get("manifest_path") or req.manifest_path,
-                "picked": picked,
-                "updated_at": time.time(),
-            }
-            data = {
-                "status": "needs_user",
-                "trace_id": trace_id,
-                "stage": "confirm_refine",
-                "conversation_id": conversation_id,
-                "prompt": str(confirm.get("message_to_user") or "Necesito más detalle para ajustar la búsqueda."),
-                "selector_instruction": str(confirm.get("selector_instruction") or ""),
-                "selected_categories": selected_categories,
-                "confidence": float(confirm.get("confidence") or 0.0),
-            }
-            summary = telemetry.summary()
-            _log_trace(summary)
-            if req.debug:
-                data["debug_info"] = summary
-            return JSONResponse(status_code=200, content=data)
-
-        try:
-            result = _run_chat_job(
-                timeout_s,
-                lambda: run_after_confirm(
-                    question,
-                    selected_categories=selected_categories,
-                    manifest_path=pre.get("manifest_path") or req.manifest_path,
-                    max_workers=req.max_workers,
-                    debug=req.debug,
-                    picked=picked,
-                ),
-            )
-        except FuturesTimeoutError:
-            result = {
-                "answer": "Se agotó el tiempo de respuesta. Puedes intentar con una consulta más específica.",
-                "selected_categories": selected_categories,
-                "references": [],
-            }
-
-        payload = {
-            "status": "ok",
+        response_payload = {
+            "status": str(result.get("status") or "ok"),
             "trace_id": trace_id,
             "conversation_id": conversation_id,
             "answer": str(result.get("answer", "")),
             "selected_categories": list(result.get("selected_categories", []) or []),
             "references": list(result.get("references", []) or []),
+            "warnings": warnings,
+            "timings_ms": summary.get("timings_ms", {}),
         }
-        summary = telemetry.summary()
-        _log_trace(summary)
         if req.debug:
-            payload["debug_info"] = summary
-        return JSONResponse(status_code=200, content=payload)
+            response_payload["debug_info"] = summary
+        return JSONResponse(status_code=200, content=response_payload)
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": "chat_failed", "details": str(exc), "trace_id": trace_id})
     finally:

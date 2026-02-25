@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -27,6 +28,27 @@ from .write import write_answer
 _PICK_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _RETRIEVAL_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+@dataclass
+class PipelineTimeouts:
+    total_s: float = 120.0
+    pick_s: float = 10.0
+    confirm_s: float = 10.0
+    refine_s: float = 10.0
+    retrieve_per_cat_s: float = 15.0
+    write_s: float = 45.0
+
+
+@dataclass
+class PipelineOptions:
+    use_picker: bool = True
+    use_confirmer: bool = False
+    use_refiner: bool = False
+    max_categories: int = 2
+    top_k: int = 8
+    max_context_chars: int = 12000
+    timeouts: PipelineTimeouts = field(default_factory=PipelineTimeouts)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -256,6 +278,208 @@ def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: floa
     picked = pick_categories(question, categories, debug=debug)
     _cache_set(_PICK_CACHE, key, dict(picked), pick_ttl_s)
     return picked, False
+
+
+def _coerce_pipeline_options(raw: Optional[Dict[str, Any]]) -> PipelineOptions:
+    opts = PipelineOptions()
+    if not raw:
+        return opts
+    t_raw = raw.get("timeouts") if isinstance(raw, dict) else None
+    if isinstance(t_raw, dict):
+        opts.timeouts = PipelineTimeouts(
+            total_s=max(5.0, float(t_raw.get("total_s", opts.timeouts.total_s))),
+            pick_s=max(1.0, float(t_raw.get("pick_s", opts.timeouts.pick_s))),
+            confirm_s=max(1.0, float(t_raw.get("confirm_s", opts.timeouts.confirm_s))),
+            refine_s=max(1.0, float(t_raw.get("refine_s", opts.timeouts.refine_s))),
+            retrieve_per_cat_s=max(1.0, float(t_raw.get("retrieve_per_cat_s", opts.timeouts.retrieve_per_cat_s))),
+            write_s=max(1.0, float(t_raw.get("write_s", opts.timeouts.write_s))),
+        )
+    opts.use_picker = bool(raw.get("use_picker", opts.use_picker))
+    opts.use_confirmer = bool(raw.get("use_confirmer", opts.use_confirmer))
+    opts.use_refiner = bool(raw.get("use_refiner", opts.use_refiner))
+    opts.max_categories = max(1, min(3, int(raw.get("max_categories", opts.max_categories))))
+    opts.top_k = max(1, min(30, int(raw.get("top_k", opts.top_k))))
+    opts.max_context_chars = max(1000, min(30000, int(raw.get("max_context_chars", opts.max_context_chars))))
+    return opts
+
+
+def run_pipeline_resilient(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    pipeline: Optional[Dict[str, Any]] = None,
+    manual_categories: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    opts = _coerce_pipeline_options(pipeline)
+    warnings: List[str] = []
+    degrade_steps: List[str] = []
+    manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
+
+    mp = manifest_path or _default_manifest_path()
+    manifest = load_manifest(Path(mp))
+    valid_set = set(manifest.categories.keys())
+
+    if not opts.use_picker and not manual_categories:
+        return {
+            "error": "missing_minimum",
+            "details": "Debes activar Picker o indicar categorías manuales.",
+        }
+
+    def _elapsed_s() -> float:
+        return max(0.0, time.perf_counter() - started)
+
+    def _remaining_s() -> float:
+        return max(0.0, opts.timeouts.total_s - _elapsed_s())
+
+    def _degrade_once(reason: str) -> bool:
+        if opts.use_confirmer:
+            opts.use_confirmer = False
+            msg = f"Se desactivó confirmer por tiempo ({reason})."
+        elif opts.use_refiner:
+            opts.use_refiner = False
+            msg = f"Se desactivó refiner por tiempo ({reason})."
+        elif opts.max_categories > 1:
+            opts.max_categories = 1
+            msg = f"Se redujo max_categories a 1 por tiempo ({reason})."
+        elif opts.top_k > 4 or opts.max_context_chars > 6000:
+            opts.top_k = min(opts.top_k, 4)
+            opts.max_context_chars = min(opts.max_context_chars, 6000)
+            msg = f"Se redujeron top_k/contexto por tiempo ({reason})."
+        else:
+            return False
+        warnings.append(msg)
+        degrade_steps.append(msg)
+        return True
+
+    if _remaining_s() < 5 and not _degrade_once("presupuesto crítico inicial"):
+        warnings.append("Presupuesto de tiempo extremadamente bajo.")
+
+    selected_categories: List[str] = []
+    picked_curr: Dict[str, Any] = {}
+    pick_ttl_s = _env_float("WEBAPP_PICK_CACHE_TTL_S", 600)
+
+    if opts.use_picker:
+        pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_s() - 2))
+        picked_curr = _timed_stage(
+            "pick",
+            lambda: _run_with_timeout(pick_timeout, lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug), ({}, False))[0],
+        )
+        selected_categories = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
+        if not selected_categories:
+            warnings.append("Picker no devolvió categorías válidas; se intentarán categorías manuales.")
+    if not selected_categories and manual_categories:
+        selected_categories = [c for c in manual_categories if c in valid_set][: opts.max_categories]
+
+    if not selected_categories:
+        return {
+            "error": "missing_minimum",
+            "details": "Debes activar Picker o indicar categorías manuales.",
+        }
+
+    if opts.use_confirmer and selected_categories:
+        confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_s() - 2))
+        confirm_data = _timed_stage(
+            "confirm",
+            lambda: _run_with_timeout(
+                confirm_timeout,
+                lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=True, debug=debug),
+                {"categories_final": selected_categories, "suggested_categories": selected_categories, "_timeout": True},
+            ),
+        )
+        if confirm_data.get("_timeout"):
+            _degrade_once("timeout en confirmer")
+        selected_categories = [c for c in (confirm_data.get("categories_final") or confirm_data.get("suggested_categories") or selected_categories) if c in valid_set][: opts.max_categories]
+
+    while _remaining_s() < 8 and _degrade_once("presupuesto crítico"):
+        pass
+
+    must_terms = list(picked_curr.get("must_include_terms", []) or [])
+    avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
+    q_final = question
+
+    refiners: List[Dict[str, Any]] = []
+    if opts.use_refiner:
+        refine_timeout = min(opts.timeouts.refine_s, max(1.0, _remaining_s() - 2))
+        refiners = _timed_stage(
+            "refine",
+            lambda: _run_with_timeout(refine_timeout, lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=debug), []),
+        )
+        if not refiners:
+            _degrade_once("timeout en refiner")
+
+    doc_counts = _count_docs_by_category(manifest)
+    category_infos: List[Dict[str, Any]] = []
+    for cname in selected_categories[: opts.max_categories]:
+        cat = manifest.categories.get(cname)
+        vs_id = str(getattr(cat, "vector_store_id", "") or "").strip() if cat else ""
+        category_infos.append({"category": cname, "vector_store_id": vs_id, "docs": int(doc_counts.get(cname, 0)), "vs_exists": bool(vs_id)})
+
+    retrieval_key = hashlib.sha1(
+        json.dumps({"q": _normalize_question(q_final), "cats": [x["category"] for x in category_infos], "manifest": _manifest_version(mp)}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    all_hits = _cache_get(_RETRIEVAL_CACHE, retrieval_key)
+    retrieval_cache_hit = all_hits is not None
+    if all_hits is None and _remaining_s() > 6:
+        retrieve_timeout = min(opts.timeouts.retrieve_per_cat_s, max(1.0, _remaining_s() / max(1, len(category_infos))))
+        all_hits = _timed_stage(
+            "retrieval",
+            lambda: _retrieve_by_category(
+                q_final=q_final,
+                refiners=refiners,
+                category_infos=category_infos,
+                max_workers=max_workers,
+                retrieve_timeout_s=retrieve_timeout,
+                top_k=opts.top_k,
+                debug=debug,
+            ),
+        )
+        _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits or []), _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800))
+    elif all_hits is None:
+        all_hits = []
+        _degrade_once("sin tiempo para retrieval")
+
+    all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits or []), library_root=Path(mp).parent)
+    all_hits = _cap_evidence_chars((all_hits or [])[:30], opts.max_context_chars)
+    references = _collect_references(manifest, all_hits)
+
+    if _remaining_s() < 5 and not all_hits:
+        warning = "No alcancé a consultar documentos a tiempo"
+        warnings.append(warning)
+        labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
+        answer = f"{warning}.\n\nRespuesta de mejor esfuerzo para: '{question}'.\nCategorías consideradas: {labels}."
+        return {
+            "status": "ok",
+            "answer": answer,
+            "references": [],
+            "selected_categories": selected_categories,
+            "warnings": warnings,
+            "degrade_steps": degrade_steps,
+            "retrieval_cache_hit": retrieval_cache_hit,
+        }
+
+    write_timeout = min(opts.timeouts.write_s, max(1.0, _remaining_s() - 1))
+    answer = _timed_stage(
+        "answer_generation",
+        lambda: _run_with_timeout(write_timeout, lambda: write_answer(q_final, all_hits, debug=debug), ""),
+    )
+    if not answer:
+        warning = "No alcancé a consultar documentos a tiempo"
+        warnings.append(warning)
+        labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
+        answer = f"{warning}.\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
+
+    return {
+        "status": "ok",
+        "answer": answer,
+        "references": references,
+        "selected_categories": selected_categories,
+        "warnings": warnings,
+        "degrade_steps": degrade_steps,
+        "retrieval_cache_hit": retrieval_cache_hit,
+    }
 
 
 def run_pick_confirm(
