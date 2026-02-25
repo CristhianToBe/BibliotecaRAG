@@ -75,8 +75,18 @@
           </div>
 
           <div class="small" v-if="loadingChat">Etapa actual: {{ currentStageLabel }}</div>
+          <div class="msg bot" v-if="pendingConfirmation">
+            <strong>Confirmación requerida:</strong> {{ pendingConfirmation.message }}
+            <div class="small" v-if="pendingConfirmation.suggestedCategories && pendingConfirmation.suggestedCategories.length">
+              Sugeridas: {{ pendingConfirmation.suggestedCategories.join(', ') }}
+            </div>
+            <div class="row inline" style="margin-top:8px;">
+              <button @click="confirmPendingCategories" :disabled="loadingChat">Confirmar y continuar</button>
+              <button @click="cancelPendingConfirmation" :disabled="loadingChat">Cancelar</button>
+            </div>
+          </div>
           <div class="row"><textarea v-model="question" rows="3" placeholder="Haz una pregunta..."></textarea></div>
-          <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">{{ loadingChat ? `Consultando... ${currentStageLabel}` : 'Enviar pregunta' }}</button>
+          <button @click="sendQuestion" :disabled="loadingChat || !question.trim() || !!pendingConfirmation">{{ loadingChat ? `Consultando... ${currentStageLabel}` : 'Enviar pregunta' }}</button>
         </section>
 
         <section class="card">
@@ -212,6 +222,9 @@
             uploadProgress: 0,
             uploadStatus: "",
             uploadOk: false,
+            pendingConfirmation: null,
+            pendingConversationId: null,
+            pendingQuestion: "",
           };
         },
         watch: {
@@ -469,16 +482,37 @@
               if (timeoutId) clearTimeout(timeoutId);
               const data = await r.json();
               if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
-              this.messages.push({
-                role: 'bot',
-                text: data.answer || '(sin respuesta)',
-                selectedCategories: data.selected_categories || [],
-                references: data.references || [],
-                warnings: data.warnings || [],
-                timings: this.debugMode ? data.timings_ms || null : null,
-              });
-              this.currentStageLabel = 'done';
-              this.scrollChatToBottom();
+              if (this.debugMode) console.log('[DEBUG_CHAT_RESPONSE]', data);
+              if (data.status === 'needs_confirmation') {
+                this.pendingConversationId = data.conversation_id || null;
+                this.pendingQuestion = q;
+                this.pendingConfirmation = {
+                  message: data.message || 'Confirma las categorías sugeridas para continuar.',
+                  suggestedCategories: data.suggested_categories || [],
+                  picked: data.picked_curr || {},
+                };
+                this.messages.push({
+                  role: 'bot',
+                  text: 'Se requiere confirmación antes de continuar con retrieval y redacción.',
+                  selectedCategories: data.suggested_categories || [],
+                  references: [],
+                  warnings: [],
+                  timings: this.debugMode ? data.timings_ms || null : null,
+                });
+                this.currentStageLabel = 'confirm';
+                this.scrollChatToBottom();
+              } else {
+                this.messages.push({
+                  role: 'bot',
+                  text: data.answer || '(sin respuesta)',
+                  selectedCategories: data.selected_categories || [],
+                  references: data.references || [],
+                  warnings: data.warnings || [],
+                  timings: this.debugMode ? data.timings_ms || null : null,
+                });
+                this.currentStageLabel = 'done';
+                this.scrollChatToBottom();
+              }
             } catch (e) {
               const friendly = (e && e.name === 'AbortError') ? 'La consulta sigue en proceso. Intenta modo rápido o timeout mayor.' : e.message;
               this.messages.push({ role: 'bot', text: `Error: ${friendly}`, references: [] });
@@ -487,6 +521,54 @@
               this.loadingChat = false;
               if (this.stageTicker) { clearInterval(this.stageTicker); this.stageTicker = null; }
             }
+          },
+          async confirmPendingCategories() {
+            if (!this.pendingConfirmation || this.loadingChat) return;
+            this.loadingChat = true;
+            this.currentStageLabel = 'continuando';
+            try {
+              const payload = this.buildPayload(this.pendingQuestion || this.question || '');
+              payload.conversation_id = this.pendingConversationId;
+              payload.continue_from = {
+                stage: 'confirm_refine',
+                selected_categories: this.pendingConfirmation.suggestedCategories || [],
+                selector_instruction: '',
+                user_reply: '',
+              };
+              // avoid asking confirmation twice after user accepted
+              if (payload.pipeline) payload.pipeline.use_confirmer = false;
+              if (this.debugMode) console.log('[DEBUG_CHAT_CONTINUE_PAYLOAD]', JSON.stringify(payload));
+              const r = await fetch(apiUrl('/api/chat'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              const data = await r.json();
+              if (!r.ok) throw new Error(this.extractError(data, 'Error continuando chat'));
+              this.messages.push({
+                role: 'bot',
+                text: data.answer || '(sin respuesta)',
+                selectedCategories: data.selected_categories || [],
+                references: data.references || [],
+                warnings: data.warnings || [],
+                timings: this.debugMode ? data.timings_ms || null : null,
+              });
+              this.pendingConfirmation = null;
+              this.pendingConversationId = null;
+              this.pendingQuestion = '';
+              this.currentStageLabel = 'done';
+              this.scrollChatToBottom();
+            } catch (e) {
+              this.messages.push({ role: 'bot', text: `Error: ${e.message || e}`, references: [] });
+            } finally {
+              this.loadingChat = false;
+            }
+          },
+          cancelPendingConfirmation() {
+            this.pendingConfirmation = null;
+            this.pendingConversationId = null;
+            this.pendingQuestion = '';
+            this.currentStageLabel = 'done';
           },
           onFile(event) { this.selectedFile = event.target.files?.[0] || null; },
           uploadFile() {

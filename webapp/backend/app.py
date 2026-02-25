@@ -16,7 +16,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
-from worklib.query.pipeline import run_pipeline_resilient
+from worklib.query.pipeline import run_pick_confirm, run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
 from worklib.store import load_manifest
 
@@ -337,6 +337,45 @@ async def chat(request: Request):
                 debug_manifest_keys = list(manifest_debug.categories.keys()) if isinstance(manifest_debug.categories, dict) else []
             except Exception as exc:
                 print("[DEBUG] /api/chat manifest_keys_error", str(exc))
+
+        if (not req.continue_from) and bool(pipeline_payload.get("use_confirmer")):
+            pre = run_pick_confirm(
+                payload["message"],
+                manifest_path=payload.get("manifest_path"),
+                debug=req.debug,
+                confirm_glimpse=req.confirm_glimpse,
+            )
+            picked_pre = pre.get("picked") or {}
+            confirm_pre = pre.get("confirm") or {}
+            suggested = list(confirm_pre.get("categories_final") or confirm_pre.get("suggested_categories") or picked_pre.get("selected") or [])
+            valid_manifest_path = pre.get("manifest_path") or payload.get("manifest_path")
+            PENDING_CONVERSATIONS[conversation_id] = {
+                "last_question": payload["message"],
+                "manifest_path": valid_manifest_path,
+                "picked": picked_pre,
+                "selected_categories": suggested,
+            }
+            if req.debug:
+                print("[DEBUG] /api/chat needs_confirmation", {
+                    "trace_id": trace_id,
+                    "status": "needs_confirmation",
+                    "picked_curr": picked_pre,
+                    "confirm": confirm_pre,
+                    "suggested_categories": suggested,
+                })
+            return JSONResponse(status_code=200, content={
+                "status": "needs_confirmation",
+                "trace_id": trace_id,
+                "conversation_id": conversation_id,
+                "question": payload["message"],
+                "suggested_categories": suggested,
+                "picked_curr": picked_pre,
+                "confirm": confirm_pre,
+                "message": str(confirm_pre.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar."),
+            })
+
+        if req.continue_from and req.continue_from.stage == "confirm_refine":
+            pipeline_payload["use_confirmer"] = False
 
         result = run_pipeline_resilient(
             payload["message"],
