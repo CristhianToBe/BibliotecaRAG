@@ -63,7 +63,6 @@ class PipelineRequest(BaseModel):
     use_picker: bool = Field(default=True, validation_alias=AliasChoices("use_picker", "picker", "usePicker"))
     use_confirmer: bool = Field(default=False, validation_alias=AliasChoices("use_confirmer", "useConfirmer"))
     use_refiner: bool = Field(default=False, validation_alias=AliasChoices("use_refiner", "useRefiner"))
-    manual_categories: str | list[str] = Field(default="", validation_alias=AliasChoices("manual_categories", "manual_categories_str", "manualCategories"))
     max_categories: int = Field(default=2, ge=1, le=3)
     top_k: int = Field(default=8, ge=1, le=30)
     max_context_chars: int = Field(default=12000, ge=1000, le=30000)
@@ -306,6 +305,23 @@ async def chat(request: Request):
             pipeline=pipeline_payload,
             manual_categories=payload.get("manual_categories"),
         )
+
+        if result.get("error") == "missing_minimum":
+            content = {
+                "error": "missing_minimum",
+                "details": "Debes activar Picker o indicar categorías manuales.",
+                "trace_id": trace_id,
+            }
+            if req.debug:
+                content["debug_received"] = {
+                    "received_pipeline": req.pipeline.model_dump(),
+                    "received_manual_categories": req.manual_categories,
+                    "raw_keys": list(req.model_dump().keys()),
+                }
+            return JSONResponse(
+                status_code=400,
+                content=content,
+            )
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
         summary = telemetry.summary()
