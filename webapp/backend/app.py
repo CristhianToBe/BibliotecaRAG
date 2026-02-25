@@ -45,8 +45,22 @@ def _upload_dir() -> Path:
     return Path(os.getenv("WEBAPP_UPLOAD_DIR", "uploads")).resolve()
 
 
-
-
+def _cors_origins() -> list[str]:
+    default_origins = ["http://127.0.0.1:8000", "http://127.0.0.1:5173", "http://localhost:5173"]
+    raw = os.getenv("WEBAPP_CORS_ORIGIN", "")
+    if not raw:
+        return default_origins
+    parts = [item.strip() for item in raw.split(",") if item.strip()]
+    if "*" in parts:
+        return ["*"]
+    seen: set[str] = set()
+    merged: list[str] = []
+    for item in parts + default_origins:
+        if item in seen:
+            continue
+        seen.add(item)
+        merged.append(item)
+    return merged
 
 class PipelineTimeoutsRequest(BaseModel):
     total_s: float = Field(default=120, ge=5, le=600)
@@ -125,7 +139,7 @@ async def validation_exception_handler(_, exc: RequestValidationError):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("WEBAPP_CORS_ORIGIN", "*")],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

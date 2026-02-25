@@ -57,6 +57,10 @@ Health: `http://127.0.0.1:8000/api/health`
 
 Frontend: `http://127.0.0.1:8000/`
 
+
+> Recomendación: abre siempre `http://127.0.0.1:8000/` (frontend servido por FastAPI).
+> Evita abrir `file://...` o un `http.server` separado salvo que configures `API_BASE` apuntando al backend.
+
 ## 5) Checks rápidos
 
 ```powershell
