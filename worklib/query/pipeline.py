@@ -247,6 +247,17 @@ def _cap_evidence_chars(hits: List[Dict[str, Any]], max_chars: int) -> List[Dict
     return out
 
 
+def _shrink_evidence_payload(hits: List[Dict[str, Any]], *, max_hits: int = 5, max_per_hit_chars: int = 1200) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for h in (hits or [])[:max_hits]:
+        hh = dict(h)
+        text = str(hh.get("text") or "")
+        if len(text) > max_per_hit_chars:
+            hh["text"] = text[:max_per_hit_chars]
+        out.append(hh)
+    return out
+
+
 def _retrieve_by_category(
     *,
     q_final: str,
@@ -270,7 +281,7 @@ def _retrieve_by_category(
         trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
         if not vs_id:
             if debug:
-                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": 0.0, "hits_count": 0, "reason": "missing_vs"})
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": 0.0, "hits_count": 0, "timed_out": False, "reason": "missing_vs"})
             if telemetry:
                 telemetry.mark_retrieval_category(cname, 0.0, "missing_vs")
             return []
@@ -294,10 +305,10 @@ def _retrieve_by_category(
         if elapsed > retrieve_timeout_s:
             status = "timeout"
             if debug:
-                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": "timeout"})
+                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "timed_out": True, "reason": "timeout"})
             return []
         if debug:
-            print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": status})
+            print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "timed_out": status == "timeout", "reason": status})
         if telemetry:
             telemetry.mark_retrieval_category(cname, elapsed, status)
         return out
@@ -591,8 +602,13 @@ def run_pipeline_resilient(
     def _elapsed_s() -> float:
         return max(0.0, time.perf_counter() - started)
 
+    reserved_write_s = min(opts.timeouts.write_s, max(1.0, opts.timeouts.total_s / 2))
+
     def _remaining_s() -> float:
         return max(0.0, opts.timeouts.total_s - _elapsed_s())
+
+    def _remaining_prewrite_s() -> float:
+        return max(0.0, opts.timeouts.total_s - reserved_write_s - _elapsed_s())
 
     def _degrade_once(reason: str) -> bool:
         if opts.use_confirmer:
@@ -614,7 +630,7 @@ def run_pipeline_resilient(
         degrade_steps.append(msg)
         return True
 
-    if _remaining_s() < 5 and not _degrade_once("presupuesto crítico inicial"):
+    if _remaining_prewrite_s() < 5 and not _degrade_once("presupuesto crítico inicial"):
         warnings.append("Presupuesto de tiempo extremadamente bajo.")
 
     selected_categories: List[str] = []
@@ -622,7 +638,7 @@ def run_pipeline_resilient(
     pick_ttl_s = _env_float("WEBAPP_PICK_CACHE_TTL_S", 600)
 
     if opts.use_picker:
-        pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_s() - 2))
+        pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_prewrite_s() - 2))
         _debug_log("PICK_INPUT_SUMMARY", {
             "user_len": len(question or ""),
             "model": os.getenv("MODEL_PICK", "gpt-5-nano"),
@@ -693,7 +709,7 @@ def run_pipeline_resilient(
 
     confirm_data: Dict[str, Any] = {}
     if opts.use_confirmer and selected_categories:
-        confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_s() - 2))
+        confirm_timeout = min(opts.timeouts.confirm_s, max(1.0, _remaining_prewrite_s() - 2))
         confirm_data, confirm_timed_out, confirm_elapsed_s, confirm_calls, confirm_result_used = _run_stage_with_timeout(
             "confirm",
             confirm_timeout,
@@ -718,7 +734,7 @@ def run_pipeline_resilient(
             telemetry.mark_stage("confirm", 0.0)
         _stage_end("confirm", started_at=s, stage_budget_s=opts.timeouts.confirm_s, skipped=True, reason="disabled_or_no_categories")
 
-    while _remaining_s() < 8 and _degrade_once("presupuesto crítico"):
+    while _remaining_prewrite_s() < 8 and _degrade_once("presupuesto crítico"):
         pass
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
@@ -727,7 +743,7 @@ def run_pipeline_resilient(
 
     refiners: List[Dict[str, Any]] = []
     if opts.use_refiner:
-        refine_timeout = min(opts.timeouts.refine_s, max(1.0, _remaining_s() - 2))
+        refine_timeout = min(opts.timeouts.refine_s, max(1.0, _remaining_prewrite_s() - 2))
         refiners, refine_timed_out, refine_elapsed_s, refine_calls, refine_result_used = _run_stage_with_timeout(
             "refine",
             refine_timeout,
@@ -797,8 +813,8 @@ def run_pipeline_resilient(
         retrieval_cache_hit = False
         all_hits = None
 
-    if all_hits is None and _remaining_s() > 6:
-        retrieve_timeout = min(opts.timeouts.retrieve_per_cat_s, max(1.0, _remaining_s() / max(1, len(category_infos))))
+    if all_hits is None and _remaining_prewrite_s() > 6:
+        retrieve_timeout = min(opts.timeouts.retrieve_per_cat_s, max(1.0, _remaining_prewrite_s() / max(1, len(category_infos))))
         _debug_log("RETRIEVAL_EXECUTED", {
             "categories": [x.get("category") for x in category_infos],
             "category_infos": category_infos,
@@ -823,14 +839,14 @@ def run_pipeline_resilient(
             allow_debug_late_output=True,
         )
         if retrieval_timed_out:
-            warnings.append("Retrieval timed out; se devolvió evidencia parcial o vacía.")
-            degrade_steps.append("Retrieval timed out")
             _debug_log("RETRIEVAL_TIMEOUT_OBSERVED", {
                 "elapsed_ms": round(retrieval_elapsed_s * 1000, 2),
                 "budget_ms": round(retrieve_timeout * 1000, 2),
                 "stage_result_used": retrieval_result_used,
             })
             if not all_hits:
+                warnings.append("Retrieval timed out; se devolvió evidencia parcial o vacía.")
+                degrade_steps.append("Retrieval timed out")
                 all_hits = _retrieve_quick_fallback(
                     q_final=q_final,
                     category_infos=category_infos,
@@ -849,7 +865,7 @@ def run_pipeline_resilient(
         if telemetry:
             telemetry.mark_stage("retrieval", 0.0)
         sret = _stage_begin("retrieval", stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="insufficient_remaining_budget")
-        _debug_log("RETRIEVAL_SKIPPED", {"reason": "insufficient_remaining_budget", "remaining_s": _remaining_s()})
+        _debug_log("RETRIEVAL_SKIPPED", {"reason": "insufficient_remaining_budget", "remaining_s": _remaining_prewrite_s()})
         _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, degraded=True, reason="insufficient_remaining_budget", extra={"hits_len": 0})
     else:
         if telemetry:
@@ -859,8 +875,16 @@ def run_pipeline_resilient(
         _stage_end("retrieval", started_at=sret, stage_budget_s=opts.timeouts.retrieve_per_cat_s, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
 
     all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits or []), library_root=Path(mp).parent)
-    all_hits = _cap_evidence_chars((all_hits or [])[:30], opts.max_context_chars)
+    all_hits = _shrink_evidence_payload((all_hits or []), max_hits=5, max_per_hit_chars=1200)
+    all_hits = _cap_evidence_chars(all_hits, opts.max_context_chars)
     references = _collect_references(manifest, all_hits)
+
+    retrieval_degraded = False
+    if telemetry:
+        status_map = telemetry.summary().get("retrieval_status_by_category", {})
+        retrieval_degraded = any(v in ("timeout", "failed") for v in status_map.values())
+        if retrieval_degraded and all_hits:
+            warnings.append("Retrieval parcial: al menos una categoría agotó tiempo o falló.")
 
     if debug:
         timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
@@ -910,48 +934,7 @@ def run_pipeline_resilient(
             })
         return out
 
-    if _remaining_s() < 5 and not all_hits:
-        warning = "No alcancé a consultar documentos a tiempo"
-        warnings.append(warning)
-        labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
-        answer = f"{warning}.\n\nRespuesta de mejor esfuerzo para: '{question}'.\nCategorías consideradas: {labels}."
-        if debug:
-            print("[DEBUG] run_pipeline_resilient fallback", {
-                "trace_id": trace_id,
-                "reason": "sin tiempo o evidencia (mejor esfuerzo)",
-                "answer_len": len(answer),
-                "answer_preview": answer[:220],
-                "warnings": warnings,
-                "degrade_steps": degrade_steps,
-            })
-        out = {
-            "status": "ok",
-            "answer": answer,
-            "references": [],
-            "selected_categories": selected_categories,
-            "warnings": warnings,
-            "degrade_steps": degrade_steps,
-            "retrieval_cache_hit": retrieval_cache_hit,
-        }
-        if debug:
-            out["debug_picker"] = {
-                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-                "picked_curr": picked_curr,
-                "selected_categories": selected_categories,
-            }
-            out["debug_pipeline"] = debug_pipeline
-            out["debug_pipeline"].update({
-                "picked_curr": picked_curr,
-                "selected_categories": selected_categories,
-                "all_hits_len": len(all_hits or []),
-                "confirm_refine_executed": {
-                    "confirm": bool(debug_pipeline["stages"].get("confirm") and not debug_pipeline["stages"]["confirm"].get("skipped")),
-                    "refine": bool(debug_pipeline["stages"].get("refine") and not debug_pipeline["stages"]["refine"].get("skipped")),
-                },
-            })
-        return out
-
-    write_timeout = min(opts.timeouts.write_s, max(1.0, _remaining_s() - 1))
+    write_timeout = max(1.0, opts.timeouts.write_s)
     answer, writer_timed_out, _, _, writer_result_used = _run_stage_with_timeout(
         "answer_generation",
         write_timeout,
@@ -970,10 +953,19 @@ def run_pipeline_resilient(
         })
 
     if not answer:
-        warning = "No alcancé a consultar documentos a tiempo"
-        warnings.append(warning)
-        labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
-        answer = f"{warning}.\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
+        if all_hits:
+            warning = f"No alcancé a redactar la respuesta completa dentro del tiempo, pero sí recuperé {len(all_hits)} fragmentos."
+            warnings.append(warning)
+            refs_top = references[:3]
+            excerpts = [str(h.get("text") or "").strip()[:300] for h in (all_hits or [])[:3] if str(h.get("text") or "").strip()]
+            refs_lines = [f"- {r.get('filename') or 'sin_nombre'} ({r.get('abs_path') or 'sin_ruta'})" for r in refs_top]
+            ex_lines = [f"- {x}" for x in excerpts]
+            answer = warning + "\n\nReferencias principales:\n" + ("\n".join(refs_lines) if refs_lines else "- (sin referencias)") + "\n\nExtractos:\n" + ("\n".join(ex_lines) if ex_lines else "- (sin extractos)")
+        else:
+            warning = "No se recuperó evidencia del repositorio en esta ejecución (0 fragmentos)."
+            warnings.append(warning)
+            labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
+            answer = f"{warning}\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
         if debug:
             print("[DEBUG] run_pipeline_resilient fallback", {
                 "trace_id": trace_id,
