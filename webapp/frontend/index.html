@@ -88,7 +88,7 @@
             </div>
           </div>
           <div class="row">
-            <textarea v-model="question" rows="3" placeholder="Haz una pregunta..."></textarea>
+            <textarea v-model="question" rows="3" :placeholder="inputPlaceholder"></textarea>
           </div>
           <button @click="sendQuestion" :disabled="loadingChat || !question.trim()">
             {{ loadingChat ? 'Consultando...' : 'Enviar pregunta' }}
@@ -131,7 +131,14 @@
             uploadStatus: "",
             uploadOk: false,
             debugMode: false,
+            pendingConfirm: null,
+            originalQuestion: "",
           };
+        },
+        computed: {
+          inputPlaceholder() {
+            return this.pendingConfirm ? "Responde para ajustar el enfoque..." : "Haz una pregunta...";
+          },
         },
         methods: {
           scrollChatToBottom() {
@@ -144,6 +151,7 @@
           extractError(data, fallback) {
             if (!data) return fallback;
             if (typeof data.detail === 'string') return data.detail;
+            if (typeof data.details === 'string') return data.details;
             if (data.detail && data.detail.detail) return data.detail.detail;
             if (data.detail && data.detail.error) return `${data.detail.error}: ${data.detail.detail || ''}`;
             return fallback;
@@ -156,10 +164,28 @@
             this.question = "";
             this.loadingChat = true;
             try {
-              const payload = { question: q, debug: this.debugMode };
+              let payload;
+              if (this.pendingConfirm) {
+                payload = {
+                  conversation_id: this.pendingConfirm.conversation_id,
+                  message: this.originalQuestion,
+                  debug: this.debugMode,
+                  continue_from: {
+                    stage: "confirm_refine",
+                    user_reply: q,
+                    selector_instruction: this.pendingConfirm.selector_instruction || "",
+                    selected_categories: this.pendingConfirm.selected_categories || [],
+                  },
+                };
+              } else {
+                this.originalQuestion = q;
+                payload = { message: q, debug: this.debugMode };
+              }
+
               if (this.debugMode) {
                 console.log('[Debug] request payload', payload);
               }
+
               const r = await fetch(`${API_BASE}/api/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -168,17 +194,30 @@
               const data = await r.json();
               if (this.debugMode) {
                 console.log('[Debug] raw response JSON', data);
-                console.log('[Debug] selected_categories', data.selected_categories || data.debug_info?.selected_categories || []);
-                console.log('[Debug] references', data.references || data.debug_info?.references || []);
               }
               if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
-              this.messages.push({
-                role: "bot",
-                text: data.answer || "(sin respuesta)",
-                selectedCategories: data.selected_categories || [],
-                references: data.references || [],
-                debugInfo: this.debugMode ? data.debug_info || null : null,
-              });
+
+              if (data.status === 'needs_user') {
+                this.pendingConfirm = {
+                  conversation_id: data.conversation_id,
+                  selector_instruction: data.selector_instruction || '',
+                  selected_categories: data.selected_categories || [],
+                };
+                this.messages.push({
+                  role: "bot",
+                  text: data.prompt || "Necesito más detalle para ajustar la búsqueda.",
+                  references: [],
+                });
+              } else {
+                this.pendingConfirm = null;
+                this.messages.push({
+                  role: "bot",
+                  text: data.answer || "(sin respuesta)",
+                  selectedCategories: data.selected_categories || [],
+                  references: data.references || [],
+                  debugInfo: this.debugMode ? data.debug_info || null : null,
+                });
+              }
               this.scrollChatToBottom();
             } catch (e) {
               if (this.debugMode) {

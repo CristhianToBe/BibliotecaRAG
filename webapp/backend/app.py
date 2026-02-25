@@ -5,6 +5,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -16,9 +17,11 @@ from pydantic import BaseModel, Field
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
-from worklib.query.pipeline import pro_query_non_interactive
+from worklib.query.pipeline import run_after_confirm, run_pick_confirm
 
 load_dotenv()
+
+PENDING_CONVERSATIONS: dict[str, dict[str, Any]] = {}
 
 
 def _allowed_upload_exts() -> set[str]:
@@ -47,32 +50,25 @@ def _chat_timeout_seconds() -> float:
         return 90.0
 
 
+class ContinueFrom(BaseModel):
+    stage: str
+    user_reply: str = ""
+    selector_instruction: str = ""
+    selected_categories: list[str] = Field(default_factory=list)
 class APIError(BaseModel):
     error: str
     detail: str
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=5000)
+    message: str = Field(default="", max_length=5000)
+    question: str = Field(default="", max_length=5000)
+    conversation_id: str | None = None
     manifest_path: str | None = None
     max_workers: int = Field(default=3, ge=1, le=16)
     debug: bool = False
-    confirm: bool = True
-    confirm_rounds: int = Field(default=4, ge=0, le=10)
     confirm_glimpse: bool = True
-
-
-class DocReference(BaseModel):
-    doc_id: str
-    filename: str
-    abs_path: str
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    references: list[DocReference]
-    selected_categories: list[str] | None = None
-    debug_info: dict | None = None
+    continue_from: ContinueFrom | None = None
 
 
 class UploadResponse(BaseModel):
@@ -130,38 +126,88 @@ def health() -> dict:
 
 @app.post("/api/chat")
 def chat(req: ChatRequest):
-    q = req.question.strip()
-    if not q:
-        return JSONResponse(status_code=400, content={"error": "invalid_question", "details": "question no puede estar vacía"})
-
+    question = (req.message or req.question or "").strip()
     timeout_s = _chat_timeout_seconds()
     started_at = time.perf_counter()
+
+    if req.continue_from and req.continue_from.stage == "confirm_refine":
+        conversation_id = (req.conversation_id or "").strip()
+        if not conversation_id:
+            return JSONResponse(status_code=400, content={"error": "missing_conversation_id", "details": "conversation_id es requerido"})
+
+        pending = PENDING_CONVERSATIONS.get(conversation_id)
+        if not pending or pending.get("stage") != "confirm_refine":
+            return JSONResponse(status_code=409, content={"error": "invalid_continuation", "details": "No hay estado pendiente para confirm_refine"})
+
+        if req.debug:
+            print(f"[DEBUG] /api/chat continuation received conversation_id={conversation_id}")
+
+        base_question = pending.get("last_question") or question
+        selected_categories = req.continue_from.selected_categories or pending.get("selected_categories") or []
+        selector_instruction = req.continue_from.selector_instruction or pending.get("selector_instruction") or ""
+        user_reply = req.continue_from.user_reply or ""
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(
+                    run_after_confirm,
+                    base_question,
+                    selected_categories=selected_categories,
+                    selector_instruction=selector_instruction,
+                    user_reply=user_reply,
+                    manifest_path=pending.get("manifest_path") or req.manifest_path,
+                    max_workers=req.max_workers,
+                    debug=req.debug,
+                    picked=pending.get("picked"),
+                )
+                result = fut.result(timeout=timeout_s)
+        except FuturesTimeoutError:
+            return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": f"chat pipeline exceeded timeout of {timeout_s} seconds"})
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"error": "chat_failed", "details": str(exc)})
+        finally:
+            PENDING_CONVERSATIONS.pop(conversation_id, None)
+
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        payload = {
+            "status": "ok",
+            "conversation_id": conversation_id,
+            "answer": str(result.get("answer", "")),
+            "selected_categories": list(result.get("selected_categories", []) or []),
+            "references": list(result.get("references", []) or []),
+        }
+        if req.debug:
+            payload["debug_info"] = {"timings": {"total_ms": elapsed_ms, "timeout_s": timeout_s, "stage": "confirm_refine_continue"}}
+        return JSONResponse(status_code=200, content=payload)
+
+    if not question:
+        return JSONResponse(status_code=400, content={"error": "invalid_question", "details": "message no puede estar vacía"})
+
+    conversation_id = (req.conversation_id or uuid.uuid4().hex).strip()
 
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(
-                pro_query_non_interactive,
-                q,
+                run_pick_confirm,
+                question,
                 manifest_path=req.manifest_path,
-                max_workers=req.max_workers,
                 debug=req.debug,
-                confirm=req.confirm,
-                confirm_rounds=req.confirm_rounds,
                 confirm_glimpse=req.confirm_glimpse,
             )
-            result = fut.result(timeout=timeout_s)
-        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            pre = fut.result(timeout=timeout_s)
     except FuturesTimeoutError:
-        details = f"chat pipeline exceeded timeout of {timeout_s} seconds"
-        return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": details})
+        return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": f"chat pipeline exceeded timeout of {timeout_s} seconds"})
     except FileNotFoundError as exc:
         return JSONResponse(status_code=404, content={"error": "manifest_not_found", "details": str(exc)})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": "chat_failed", "details": str(exc)})
 
-    answer = str(result.get("answer", ""))
-    references = list(result.get("references", []) or [])
-    selected_categories = list(result.get("selected_categories", []) or [])
+    confirm = dict(pre.get("confirm") or {})
+    picked = dict(pre.get("picked") or {})
+    action = str(confirm.get("action") or "REFINE").upper()
+    categories_final = list(confirm.get("categories_final") or [])
+    suggested_categories = list(confirm.get("suggested_categories") or [])
+    selected_categories = categories_final or suggested_categories or list((picked.get("selected") or [])[:2])
 
     payload = {
         "answer": answer,
@@ -170,12 +216,61 @@ def chat(req: ChatRequest):
     }
 
     if req.debug:
-        payload["debug_info"] = {
-            "timings": {"total_ms": elapsed_ms, "timeout_s": timeout_s},
+        print(f"[DEBUG] confirm.action={action}")
+
+    if action == "REFINE":
+        PENDING_CONVERSATIONS[conversation_id] = {
+            "stage": "confirm_refine",
+            "prompt": str(confirm.get("message_to_user") or ""),
+            "selector_instruction": str(confirm.get("selector_instruction") or ""),
             "selected_categories": selected_categories,
-            "references": references,
-            "pipeline": {k: v for k, v in result.items() if k not in {"answer", "references", "selected_categories"}},
+            "last_question": question,
+            "manifest_path": pre.get("manifest_path") or req.manifest_path,
+            "picked": picked,
+            "updated_at": time.time(),
         }
+        if req.debug:
+            print(f"[DEBUG] returning needs_user conversation_id={conversation_id}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "needs_user",
+                "stage": "confirm_refine",
+                "conversation_id": conversation_id,
+                "prompt": str(confirm.get("message_to_user") or "Necesito más detalle para ajustar la búsqueda."),
+                "selector_instruction": str(confirm.get("selector_instruction") or ""),
+                "selected_categories": selected_categories,
+                "confidence": float(confirm.get("confidence") or 0.0),
+            },
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(
+                run_after_confirm,
+                question,
+                selected_categories=selected_categories,
+                manifest_path=pre.get("manifest_path") or req.manifest_path,
+                max_workers=req.max_workers,
+                debug=req.debug,
+                picked=picked,
+            )
+            result = fut.result(timeout=timeout_s)
+    except FuturesTimeoutError:
+        return JSONResponse(status_code=504, content={"error": "chat_timeout", "details": f"chat pipeline exceeded timeout of {timeout_s} seconds"})
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": "chat_failed", "details": str(exc)})
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    payload = {
+        "status": "ok",
+        "conversation_id": conversation_id,
+        "answer": str(result.get("answer", "")),
+        "selected_categories": list(result.get("selected_categories", []) or []),
+        "references": list(result.get("references", []) or []),
+    }
+    if req.debug:
+        payload["debug_info"] = {"timings": {"total_ms": elapsed_ms, "timeout_s": timeout_s, "stage": "complete"}}
 
     return JSONResponse(status_code=200, content=payload)
 

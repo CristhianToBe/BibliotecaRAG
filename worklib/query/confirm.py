@@ -171,6 +171,31 @@ def confirm_loop(
     return (q_curr, suggested, picked_curr)
 
 
+
+def confirm_once_non_interactive(
+    question: str,
+    *,
+    picked: Dict[str, Any],
+    manifest: Manifest,
+    use_glimpse: bool = True,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Single non-interactive confirm pass that never asks for user input."""
+    valid = list(manifest.categories.keys())
+    suggested = list(picked.get("selected", []) or [])[:2]
+    glimpses: List[Dict[str, Any]] = _build_glimpses(manifest, suggested, question) if (use_glimpse and suggested) else []
+
+    decision = confirm_decision(
+        question,
+        suggested=suggested,
+        valid_categories=valid,
+        glimpses=glimpses,
+        user_reply="",
+        debug=debug,
+    )
+    decision["suggested_categories"] = suggested
+    return decision
+
 def confirm_loop_non_interactive(
     question: str,
     *,
