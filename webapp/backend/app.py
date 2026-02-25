@@ -247,6 +247,37 @@ async def chat(request: Request):
     try:
         conversation_id = (req.conversation_id or uuid.uuid4().hex)
 
+        pipeline_use_picker = req.pipeline.use_picker if req.pipeline is not None else None
+        top_level_use_picker = getattr(req, "use_picker", None)
+        effective_use_picker = pipeline_use_picker if pipeline_use_picker is not None else top_level_use_picker
+        if effective_use_picker is None:
+            effective_use_picker = True
+
+        raw_top_level_manual_categories = getattr(req, "manual_categories", None)
+        raw_pipeline_manual_categories = req.pipeline.manual_categories if req.pipeline is not None else None
+        top_level_manual_categories = _normalize_manual_categories(raw_top_level_manual_categories)
+        pipeline_manual_categories = _normalize_manual_categories(raw_pipeline_manual_categories)
+        effective_manual_categories = top_level_manual_categories or pipeline_manual_categories
+
+        if req.debug:
+            print(f"[DEBUG] minimum_check effective_use_picker={effective_use_picker} manual_count={len(effective_manual_categories)}")
+
+        if (not req.continue_from) and (not effective_use_picker) and (len(effective_manual_categories) == 0):
+            content = {
+                "error": "missing_minimum",
+                "details": "Debes activar Picker o indicar categorías manuales.",
+                "trace_id": trace_id,
+            }
+            if req.debug:
+                content["debug_received"] = {
+                    "effective_use_picker": effective_use_picker,
+                    "effective_manual_categories": effective_manual_categories,
+                    "raw_pipeline": req.pipeline.model_dump() if req.pipeline else None,
+                    "raw_top_level_manual_categories": raw_top_level_manual_categories,
+                    "raw_top_level_use_picker": top_level_use_picker,
+                }
+            return JSONResponse(status_code=400, content=content)
+
         if req.continue_from and req.continue_from.stage == "confirm_refine":
             pending = PENDING_CONVERSATIONS.get(conversation_id)
             if not pending:
@@ -260,15 +291,18 @@ async def chat(request: Request):
             payload = {
                 "message": question,
                 "manifest_path": req.manifest_path,
-                "manual_categories": _normalize_manual_categories(req.manual_categories),
+                "manual_categories": effective_manual_categories,
             }
+
+        pipeline_payload = req.pipeline.model_dump() if req.pipeline else PipelineRequest().model_dump()
+        pipeline_payload["use_picker"] = bool(effective_use_picker)
 
         result = run_pipeline_resilient(
             payload["message"],
             manifest_path=payload.get("manifest_path"),
             max_workers=req.max_workers,
             debug=req.debug,
-            pipeline=req.pipeline.model_dump(),
+            pipeline=pipeline_payload,
             manual_categories=payload.get("manual_categories"),
         )
 
