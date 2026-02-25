@@ -63,6 +63,7 @@ def _cors_origins() -> list[str]:
     return merged
 
 class PipelineTimeoutsRequest(BaseModel):
+    enabled: bool = True
     total_s: float = Field(default=120, ge=5, le=600)
     # debug stabilization; pick may be slow when prompt is large
     pick_s: float = Field(default=30, ge=1, le=120)
@@ -83,7 +84,8 @@ class PipelineRequest(BaseModel):
     max_categories: int = Field(default=2, ge=1, le=3)
     top_k: int = Field(default=8, ge=1, le=30)
     max_context_chars: int = Field(default=12000, ge=1000, le=30000)
-    timeouts: PipelineTimeoutsRequest = Field(default_factory=PipelineTimeoutsRequest)
+    timeouts: PipelineTimeoutsRequest | None = Field(default=None)
+    unbounded: bool | None = None
 
 
 class ContinueFrom(BaseModel):
@@ -324,7 +326,7 @@ async def chat(request: Request):
                 "manual_categories": effective_manual_categories,
             }
 
-        pipeline_payload = req.pipeline.model_dump() if req.pipeline else PipelineRequest().model_dump()
+        pipeline_payload = req.pipeline.model_dump(exclude_none=True) if req.pipeline else PipelineRequest().model_dump(exclude_none=True)
         pipeline_payload["use_picker"] = bool(effective_use_picker)
 
         debug_manifest_keys: list[str] = []

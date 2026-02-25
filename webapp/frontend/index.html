@@ -89,9 +89,10 @@
             <button @click="applyFastMode">Modo rápido</button>
             <button @click="applyFullMode">Modo completo</button>
           </div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.unbounded" /> Modo original (sin timeouts)</label></div>
           <div class="row"><label class="small">Max categorías</label><input type="number" min="1" max="3" v-model.number="settings.max_categories" /></div>
           <div class="row"><label class="small">Top-K</label><input type="number" min="1" max="30" v-model.number="settings.top_k" /></div>
-          <div class="row"><label class="small">Timeout total (s)</label><input type="number" min="5" max="600" v-model.number="settings.timeouts.total_s" /></div>
+          <div class="row" v-if="!settings.unbounded"><label class="small">Timeout total (s)</label><input type="number" min="5" max="600" v-model.number="settings.timeouts.total_s" /></div>
           <div class="row">
             <label class="small">Categorías manuales (+)</label>
             <div class="autocomplete-wrap">
@@ -200,7 +201,8 @@
               max_categories: 2,
               top_k: 8,
               max_context_chars: 12000,
-              timeouts: { total_s: 120, pick_s: 10, confirm_s: 10, refine_s: 10, retrieve_per_cat_s: 15, write_s: 45 },
+              unbounded: true,
+              timeouts: { total_s: 120, pick_s: 30, confirm_s: 20, refine_s: 20, retrieve_per_cat_s: 30, write_s: 45 },
             },
             selectedFile: null,
             title: "",
@@ -381,6 +383,7 @@
             this.multiCategory = false;
             this.settings.max_categories = 1;
             this.settings.top_k = 4;
+            this.settings.unbounded = false;
           },
           applyFullMode() {
             this.settings.use_confirmer = true;
@@ -388,6 +391,7 @@
             this.multiCategory = true;
             this.settings.max_categories = 2;
             this.settings.top_k = 8;
+            this.settings.unbounded = true;
           },
           extractError(data, fallback) {
             if (!data) return fallback;
@@ -413,8 +417,15 @@
                 use_refiner: !!this.settings.use_refiner,
                 max_categories: Number(this.settings.max_categories),
                 top_k: Number(this.settings.top_k),
-                timeouts: {
+                unbounded: !!this.settings.unbounded,
+                timeouts: this.settings.unbounded ? null : {
+                  enabled: true,
                   total_s: Number(this.settings.timeouts.total_s),
+                  pick_s: Number(this.settings.timeouts.pick_s),
+                  confirm_s: Number(this.settings.timeouts.confirm_s),
+                  refine_s: Number(this.settings.timeouts.refine_s),
+                  retrieve_per_cat_s: Number(this.settings.timeouts.retrieve_per_cat_s),
+                  write_s: Number(this.settings.timeouts.write_s),
                 },
               },
             };
@@ -437,8 +448,8 @@
             try {
               const payload = this.buildPayload(q);
               const controller = new AbortController();
-              const timeoutMs = Math.max(10000, (this.settings.timeouts.total_s + 10) * 1000);
-              const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+              const timeoutMs = this.settings.unbounded ? null : Math.max(10000, (this.settings.timeouts.total_s + 10) * 1000);
+              const timeoutId = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
               const stageSteps = ['pick', 'confirm', 'refine', 'retrieving', 'answering'];
               let idx = 0;
               this.currentStageLabel = stageSteps[idx];
@@ -455,7 +466,7 @@
                 body: JSON.stringify(payload),
                 signal: controller.signal,
               });
-              clearTimeout(timeoutId);
+              if (timeoutId) clearTimeout(timeoutId);
               const data = await r.json();
               if (!r.ok) throw new Error(this.extractError(data, 'Error en chat'));
               this.messages.push({

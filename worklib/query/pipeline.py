@@ -52,6 +52,7 @@ class PipelineOptions:
     top_k: int = 8
     max_context_chars: int = 12000
     timeouts: PipelineTimeouts = field(default_factory=PipelineTimeouts)
+    unbounded: bool = True
 
 
 TIMEOUT_GRACE_MS = 250
@@ -267,6 +268,7 @@ def _retrieve_by_category(
     retrieve_timeout_s: float,
     top_k: int,
     debug: bool,
+    unbounded: bool,
 ) -> List[Dict[str, Any]]:
     telemetry = get_telemetry()
     if telemetry:
@@ -302,8 +304,8 @@ def _retrieve_by_category(
         except Exception:
             status = "failed"
         elapsed = time.perf_counter() - started
-        if elapsed > retrieve_timeout_s:
-            # Non-fatal timeout budget overrun: keep retrieved hits and mark as degraded.
+        if (not unbounded) and elapsed > retrieve_timeout_s:
+            # Bounded mode only: mark over-budget but keep hits.
             status = "timeout_over_budget_kept_hits"
             if debug:
                 print("[DEBUG] RETRIEVAL_CAT_END", {
@@ -376,9 +378,22 @@ def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: floa
 def _coerce_pipeline_options(raw: Optional[Dict[str, Any]]) -> PipelineOptions:
     opts = PipelineOptions()
     if not raw:
+        opts.unbounded = True
         return opts
+
     t_raw = raw.get("timeouts") if isinstance(raw, dict) else None
-    if isinstance(t_raw, dict):
+    unbounded_raw = raw.get("unbounded") if isinstance(raw, dict) else None
+
+    if unbounded_raw is True:
+        opts.unbounded = True
+    elif t_raw is None:
+        opts.unbounded = True
+    elif isinstance(t_raw, dict) and (t_raw.get("enabled") is False):
+        opts.unbounded = True
+    else:
+        opts.unbounded = False
+
+    if isinstance(t_raw, dict) and opts.unbounded is False:
         opts.timeouts = PipelineTimeouts(
             total_s=max(5.0, float(t_raw.get("total_s", opts.timeouts.total_s))),
             pick_s=max(1.0, float(t_raw.get("pick_s", opts.timeouts.pick_s))),
@@ -387,6 +402,7 @@ def _coerce_pipeline_options(raw: Optional[Dict[str, Any]]) -> PipelineOptions:
             retrieve_per_cat_s=max(1.0, float(t_raw.get("retrieve_per_cat_s", opts.timeouts.retrieve_per_cat_s))),
             write_s=max(1.0, float(t_raw.get("write_s", opts.timeouts.write_s))),
         )
+
     opts.use_picker = bool(raw.get("use_picker", opts.use_picker))
     opts.use_confirmer = bool(raw.get("use_confirmer", opts.use_confirmer))
     opts.use_refiner = bool(raw.get("use_refiner", opts.use_refiner))
@@ -416,7 +432,7 @@ def run_pipeline_resilient(
 
     telemetry = get_telemetry()
     trace_id = getattr(telemetry, "trace_id", "no-trace")
-    debug_pipeline: Dict[str, Any] = {"trace_id": trace_id, "stages": {}, "query_evolution": {}}
+    debug_pipeline: Dict[str, Any] = {"trace_id": trace_id, "stages": {}, "query_evolution": {}, "unbounded": opts.unbounded}
 
     def _debug_log(label: str, payload: Dict[str, Any]) -> None:
         if not debug:
@@ -626,6 +642,7 @@ def run_pipeline_resilient(
                 retrieve_timeout_s=opts.timeouts.retrieve_per_cat_s,
                 top_k=opts.top_k,
                 debug=debug,
+                unbounded=opts.unbounded,
             ),
             [],
         )
@@ -648,8 +665,8 @@ def run_pipeline_resilient(
     retrieval_degraded = False
     if telemetry:
         status_map = telemetry.summary().get("retrieval_status_by_category", {})
-        retrieval_degraded = any(v in ("timeout", "failed", "timeout_over_budget_kept_hits") for v in status_map.values())
-        if retrieval_degraded and all_hits:
+        retrieval_degraded = any(v in ("failed",) for v in status_map.values()) if opts.unbounded else any(v in ("timeout", "failed", "timeout_over_budget_kept_hits") for v in status_map.values())
+        if retrieval_degraded and all_hits and (not opts.unbounded):
             warnings.append("Retrieval parcial: al menos una categoría agotó tiempo o falló.")
 
     if debug:
@@ -858,6 +875,7 @@ def run_after_confirm(
                 retrieve_timeout_s=retrieve_timeout_s,
                 top_k=top_k,
                 debug=debug,
+                unbounded=opts.unbounded,
             ),
         )
         if not all_hits:
