@@ -303,10 +303,19 @@ def _retrieve_by_category(
             status = "failed"
         elapsed = time.perf_counter() - started
         if elapsed > retrieve_timeout_s:
-            status = "timeout"
+            # Non-fatal timeout budget overrun: keep retrieved hits and mark as degraded.
+            status = "timeout_over_budget_kept_hits"
             if debug:
-                print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": "timeout"})
-            return []
+                print("[DEBUG] RETRIEVAL_CAT_END", {
+                    "trace_id": trace_id,
+                    "category": cname,
+                    "elapsed_ms": round(elapsed * 1000, 2),
+                    "hits_count": len(out),
+                    "reason": status,
+                })
+            if telemetry:
+                telemetry.mark_retrieval_category(cname, elapsed, status)
+            return out
         if debug:
             print("[DEBUG] RETRIEVAL_CAT_END", {"trace_id": trace_id, "category": cname, "elapsed_ms": round(elapsed * 1000, 2), "hits_count": len(out), "reason": status})
         if telemetry:
@@ -317,13 +326,13 @@ def _retrieve_by_category(
     all_hits: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_run_category, info): info for info in category_infos}
-        for fut in as_completed(futs, timeout=max(1.0, retrieve_timeout_s * max(1, len(category_infos)))):
+        for fut in as_completed(futs):
             try:
-                all_hits.extend(fut.result(timeout=retrieve_timeout_s))
+                all_hits.extend(fut.result())
             except Exception:
                 info = futs[fut]
                 if telemetry:
-                    telemetry.mark_retrieval_category(str(info["category"]), retrieve_timeout_s, "timeout")
+                    telemetry.mark_retrieval_category(str(info["category"]), 0.0, "failed")
     return all_hits
 
 
@@ -639,7 +648,7 @@ def run_pipeline_resilient(
     retrieval_degraded = False
     if telemetry:
         status_map = telemetry.summary().get("retrieval_status_by_category", {})
-        retrieval_degraded = any(v in ("timeout", "failed") for v in status_map.values())
+        retrieval_degraded = any(v in ("timeout", "failed", "timeout_over_budget_kept_hits") for v in status_map.values())
         if retrieval_degraded and all_hits:
             warnings.append("Retrieval parcial: al menos una categoría agotó tiempo o falló.")
 
