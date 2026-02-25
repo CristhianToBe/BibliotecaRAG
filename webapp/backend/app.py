@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
@@ -58,9 +58,12 @@ class PipelineTimeoutsRequest(BaseModel):
 
 
 class PipelineRequest(BaseModel):
-    use_picker: bool = True
-    use_confirmer: bool = False
-    use_refiner: bool = False
+    model_config = ConfigDict(populate_by_name=True)
+
+    use_picker: bool = Field(default=True, validation_alias=AliasChoices("use_picker", "picker", "usePicker"))
+    use_confirmer: bool = Field(default=False, validation_alias=AliasChoices("use_confirmer", "useConfirmer"))
+    use_refiner: bool = Field(default=False, validation_alias=AliasChoices("use_refiner", "useRefiner"))
+    manual_categories: str | list[str] = Field(default="", validation_alias=AliasChoices("manual_categories", "manual_categories_str", "manualCategories"))
     max_categories: int = Field(default=2, ge=1, le=3)
     top_k: int = Field(default=8, ge=1, le=30)
     max_context_chars: int = Field(default=12000, ge=1000, le=30000)
@@ -80,6 +83,8 @@ class APIError(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     message: str = Field(default="", max_length=5000)
     question: str = Field(default="", max_length=5000)
     conversation_id: str | None = None
@@ -88,8 +93,22 @@ class ChatRequest(BaseModel):
     debug: bool = False
     confirm_glimpse: bool = True
     continue_from: ContinueFrom | None = None
-    pipeline: PipelineRequest = Field(default_factory=PipelineRequest)
-    manual_categories: str | list[str] = ""
+    pipeline: PipelineRequest | None = Field(default=None)
+    manual_categories: str | list[str] = Field(default="", validation_alias=AliasChoices("manual_categories", "manual_categories_str", "manualCategories"))
+    use_picker: bool | None = Field(default=None, validation_alias=AliasChoices("use_picker", "picker", "usePicker"))
+    use_confirmer: bool | None = Field(default=None, validation_alias=AliasChoices("use_confirmer", "useConfirmer"))
+    use_refiner: bool | None = Field(default=None, validation_alias=AliasChoices("use_refiner", "useRefiner"))
+
+    @model_validator(mode="after")
+    def apply_legacy_pipeline_toggles(self) -> "ChatRequest":
+        self.pipeline = self.pipeline or PipelineRequest()
+        if self.use_picker is not None:
+            self.pipeline.use_picker = self.use_picker
+        if self.use_confirmer is not None:
+            self.pipeline.use_confirmer = self.use_confirmer
+        if self.use_refiner is not None:
+            self.pipeline.use_refiner = self.use_refiner
+        return self
 
 
 class UploadResponse(BaseModel):
@@ -206,7 +225,18 @@ def list_categories(manifest_path: str | None = None) -> dict[str, list[str]]:
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest):
+async def chat(request: Request):
+    raw_body = await request.body()
+    raw_body_preview = raw_body.decode("utf-8", errors="replace")[:2000]
+    try:
+        req = ChatRequest.model_validate_json(raw_body or b"{}")
+    except ValidationError as exc:
+        return JSONResponse(status_code=422, content={"error": "validation_error", "detail": "Payload inválido", "fields": exc.errors()})
+
+    if req.debug:
+        print("chat_debug_raw_body", raw_body_preview)
+        print("chat_debug_parsed", {"pipeline": req.pipeline.model_dump(), "manual_categories": req.manual_categories})
+
     question = (req.message or req.question or "").strip()
     if not question and not req.continue_from:
         return JSONResponse(status_code=400, content={"error": "empty_question", "details": "message o question es requerido"})
@@ -217,6 +247,37 @@ def chat(req: ChatRequest):
 
     try:
         conversation_id = (req.conversation_id or uuid.uuid4().hex)
+
+        pipeline_use_picker = req.pipeline.use_picker if req.pipeline is not None else None
+        top_level_use_picker = getattr(req, "use_picker", None)
+        effective_use_picker = pipeline_use_picker if pipeline_use_picker is not None else top_level_use_picker
+        if effective_use_picker is None:
+            effective_use_picker = True
+
+        raw_top_level_manual_categories = getattr(req, "manual_categories", None)
+        raw_pipeline_manual_categories = req.pipeline.manual_categories if req.pipeline is not None else None
+        top_level_manual_categories = _normalize_manual_categories(raw_top_level_manual_categories)
+        pipeline_manual_categories = _normalize_manual_categories(raw_pipeline_manual_categories)
+        effective_manual_categories = top_level_manual_categories or pipeline_manual_categories
+
+        if req.debug:
+            print(f"[DEBUG] minimum_check effective_use_picker={effective_use_picker} manual_count={len(effective_manual_categories)}")
+
+        if (not req.continue_from) and (not effective_use_picker) and (len(effective_manual_categories) == 0):
+            content = {
+                "error": "missing_minimum",
+                "details": "Debes activar Picker o indicar categorías manuales.",
+                "trace_id": trace_id,
+            }
+            if req.debug:
+                content["debug_received"] = {
+                    "effective_use_picker": effective_use_picker,
+                    "effective_manual_categories": effective_manual_categories,
+                    "raw_pipeline": req.pipeline.model_dump() if req.pipeline else None,
+                    "raw_top_level_manual_categories": raw_top_level_manual_categories,
+                    "raw_top_level_use_picker": top_level_use_picker,
+                }
+            return JSONResponse(status_code=400, content=content)
 
         if req.continue_from and req.continue_from.stage == "confirm_refine":
             pending = PENDING_CONVERSATIONS.get(conversation_id)
@@ -231,27 +292,20 @@ def chat(req: ChatRequest):
             payload = {
                 "message": question,
                 "manifest_path": req.manifest_path,
-                "manual_categories": _normalize_manual_categories(req.manual_categories),
+                "manual_categories": effective_manual_categories,
             }
+
+        pipeline_payload = req.pipeline.model_dump() if req.pipeline else PipelineRequest().model_dump()
+        pipeline_payload["use_picker"] = bool(effective_use_picker)
 
         result = run_pipeline_resilient(
             payload["message"],
             manifest_path=payload.get("manifest_path"),
             max_workers=req.max_workers,
             debug=req.debug,
-            pipeline=req.pipeline.model_dump(),
+            pipeline=pipeline_payload,
             manual_categories=payload.get("manual_categories"),
         )
-
-        if result.get("error") == "missing_minimum":
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "missing_minimum",
-                    "details": "Debes activar Picker o indicar categorías manuales.",
-                    "trace_id": trace_id,
-                },
-            )
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
         summary = telemetry.summary()
