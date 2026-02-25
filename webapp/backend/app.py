@@ -64,7 +64,8 @@ def _cors_origins() -> list[str]:
 
 class PipelineTimeoutsRequest(BaseModel):
     total_s: float = Field(default=120, ge=5, le=600)
-    pick_s: float = Field(default=10, ge=1, le=120)
+    # debug stabilization; pick may be slow when prompt is large
+    pick_s: float = Field(default=30, ge=1, le=120)
     # temporary to reduce false timeouts during debugging; adjust later
     confirm_s: float = Field(default=20, ge=1, le=120)
     refine_s: float = Field(default=20, ge=1, le=120)

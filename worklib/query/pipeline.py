@@ -21,7 +21,7 @@ from .paths import resolve_local_path
 from .pick import pick_categories
 from .refine import refine_all
 from .retrieve import retrieve_via_tool
-from .telemetry import RequestTelemetry, get_current_stage, get_telemetry, reset_current_stage, reset_debug_enabled, set_current_stage, set_debug_enabled, set_telemetry
+from .telemetry import RequestTelemetry, get_telemetry, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry
 from .write import write_answer
 
 
@@ -33,7 +33,8 @@ _CACHE_LOCK = threading.Lock()
 @dataclass
 class PipelineTimeouts:
     total_s: float = 120.0
-    pick_s: float = 10.0
+    # debug stabilization; pick may be slow when prompt is large
+    pick_s: float = 30.0
     # temporary to reduce false timeouts during debugging; adjust later
     confirm_s: float = 20.0
     refine_s: float = 20.0
@@ -173,6 +174,16 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
         seen.add(value)
         out.append(value)
     return out
+
+
+def _fallback_pick_categories(question: str, valid_keys: List[str], max_categories: int) -> List[str]:
+    text = str(question or "").upper()
+    ranked: List[str] = []
+    if "SARE" in text or "TRIBUT" in text or "DIAN" in text:
+        ranked.extend([k for k in valid_keys if _top_category_token(k) == "DIAN"])
+    if not ranked:
+        ranked.extend(valid_keys)
+    return _dedupe_preserve_order(ranked)[: max(1, max_categories)]
 
 
 def attach_local_paths(manifest: Manifest, hits: List[Dict[str, Any]], *, library_root: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -417,14 +428,17 @@ def run_pipeline_resilient(
     ) -> Tuple[Any, bool, float, int, str]:
         s0 = _stage_begin(stage_name, stage_budget_s=budget_s)
         calls_before = telemetry.model_calls if telemetry else 0
+        task_meta: Dict[str, Optional[float]] = {"started_at": None, "finished_at": None}
 
         def _thread_fn() -> Any:
             tele_token = set_telemetry(telemetry)
             stage_token = set_current_stage(stage_name)
             debug_token = set_debug_enabled(debug)
+            task_meta["started_at"] = time.perf_counter()
             try:
                 return fn()
             finally:
+                task_meta["finished_at"] = time.perf_counter()
                 reset_debug_enabled(debug_token)
                 reset_current_stage(stage_token)
                 reset_telemetry(tele_token)
@@ -432,18 +446,26 @@ def run_pipeline_resilient(
         ex = ThreadPoolExecutor(max_workers=1)
         fut = ex.submit(_thread_fn)
         timeout_state = {"timed_out": False}
+        stage_state = {"result_used": "pending"}
 
         if debug:
             def _on_done(_fut):
+                started_at = task_meta.get("started_at")
+                finished_at = task_meta.get("finished_at")
+                task_elapsed_ms = round((finished_at - started_at) * 1000, 2) if (started_at and finished_at) else None
+                if stage_name in debug_pipeline["stages"]:
+                    debug_pipeline["stages"][stage_name]["task_elapsed_ms"] = task_elapsed_ms
                 if timeout_state["timed_out"]:
-                    _debug_log("STAGE_LATE_RESULT", {
+                    _debug_log("STAGE_TASK_COMPLETED_LATE", {
                         "stage_name": stage_name,
-                        "note": "received output after stage timed out",
+                        "task_elapsed_ms": task_elapsed_ms,
+                        "used_or_discarded": stage_state.get("result_used", "pending"),
                     })
             fut.add_done_callback(_on_done)
 
         timed_out = False
         stage_result_used = "stage_output"
+        stage_state["result_used"] = stage_result_used
         timeout_budget = max(0.1, budget_s + (timeout_grace_ms / 1000.0))
         try:
             value = fut.result(timeout=timeout_budget)
@@ -452,12 +474,19 @@ def run_pipeline_resilient(
             timed_out = True
             value = fallback
             stage_result_used = "fallback"
+            stage_state["result_used"] = stage_result_used
+            _debug_log("STAGE_TIMEOUT", {
+                "stage_name": stage_name,
+                "budget_s": budget_s,
+                "elapsed_ms": round((time.perf_counter() - s0) * 1000, 2),
+            })
             if debug and allow_debug_late_output:
                 try:
                     late_value = fut.result(timeout=LATE_RESULT_GRACE_S)
                     value = late_value
                     timed_out = False
                     stage_result_used = "late_output_used"
+                    stage_state["result_used"] = stage_result_used
                     warnings.append(f"Se usó salida tardía de {stage_name} en modo debug.")
                     _debug_log("STAGE_LATE_RESULT_POLICY", {
                         "stage_name": stage_name,
@@ -465,14 +494,20 @@ def run_pipeline_resilient(
                         "reason": "late_output_within_debug_grace",
                     })
                 except Exception:
+                    cancelled = fut.cancel()
+                    _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled})
                     _debug_log("STAGE_LATE_RESULT_POLICY", {
                         "stage_name": stage_name,
                         "used": False,
                         "reason": "late_output_not_available_within_grace",
                     })
+            else:
+                cancelled = fut.cancel()
+                _debug_log("STAGE_CANCEL", {"stage_name": stage_name, "cancelled": cancelled})
         except Exception as exc:
             value = fallback
             stage_result_used = "fallback"
+            stage_state["result_used"] = stage_result_used
             _debug_log("STAGE_ERROR", {"stage_name": stage_name, "error": str(exc)})
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
@@ -480,6 +515,9 @@ def run_pipeline_resilient(
         elapsed_s = max(0.0, time.perf_counter() - s0)
         elapsed_ms = round(elapsed_s * 1000, 2)
         budget_ms = round(budget_s * 1000, 2)
+        started_at = task_meta.get("started_at")
+        finished_at = task_meta.get("finished_at")
+        task_elapsed_ms = round((finished_at - started_at) * 1000, 2) if (started_at and finished_at) else None
         if timeout_grace_ms > 0 and (elapsed_ms > budget_ms) and (elapsed_ms <= budget_ms + timeout_grace_ms) and not timed_out:
             _debug_log("TIMEOUT_GRACE_APPLIED", {
                 "stage_name": stage_name,
@@ -501,6 +539,7 @@ def run_pipeline_resilient(
                 "timeout_policy": f"future.result(timeout=budget+grace={timeout_budget:.3f}s)",
                 "llm_calls_made": max(0, calls_after - calls_before),
                 "stage_result_used": stage_result_used,
+                "task_elapsed_ms": task_elapsed_ms,
             },
         )
         return value, timed_out, elapsed_s, max(0, calls_after - calls_before), stage_result_used
@@ -554,11 +593,19 @@ def run_pipeline_resilient(
 
     if opts.use_picker:
         pick_timeout = min(opts.timeouts.pick_s, max(1.0, _remaining_s() - 2))
+        _debug_log("PICK_INPUT_SUMMARY", {
+            "user_len": len(question or ""),
+            "model": os.getenv("MODEL_PICK", "gpt-5-nano"),
+            "valid_set_len": len(valid_set),
+            "budget_s": pick_timeout,
+        })
         pick_result, pick_timed_out, _, _, _ = _run_stage_with_timeout(
             "pick",
             pick_timeout,
             lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug),
             ({}, False),
+            timeout_grace_ms=TIMEOUT_GRACE_MS,
+            allow_debug_late_output=True,
         )
         picked_curr = pick_result[0] if isinstance(pick_result, tuple) else {}
         raw_selected = picked_curr.get("selected") or []
@@ -581,6 +628,14 @@ def run_pipeline_resilient(
 
         if pick_timed_out:
             warnings.append("Picker alcanzó timeout; se aplicó fallback de selección.")
+            if not selected_categories:
+                valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
+                selected_categories = _fallback_pick_categories(question, valid_keys, opts.max_categories)
+                if selected_categories:
+                    _debug_log("PICK_FALLBACK_USED", {
+                        "strategy": "heuristic_defaults",
+                        "selected_categories": selected_categories,
+                    })
         if not selected_categories:
             warnings.append("Picker no devolvió categorías válidas; se intentarán categorías manuales.")
     else:
