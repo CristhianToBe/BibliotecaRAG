@@ -324,6 +324,15 @@ async def chat(request: Request):
         pipeline_payload = req.pipeline.model_dump() if req.pipeline else PipelineRequest().model_dump()
         pipeline_payload["use_picker"] = bool(effective_use_picker)
 
+        debug_manifest_keys: list[str] = []
+
+        if req.debug:
+            try:
+                manifest_debug = load_manifest(_resolve_manifest_path(payload.get("manifest_path")))
+                debug_manifest_keys = list(manifest_debug.categories.keys()) if isinstance(manifest_debug.categories, dict) else []
+            except Exception as exc:
+                print("[DEBUG] /api/chat manifest_keys_error", str(exc))
+
         result = run_pipeline_resilient(
             payload["message"],
             manifest_path=payload.get("manifest_path"),
@@ -333,10 +342,34 @@ async def chat(request: Request):
             manual_categories=payload.get("manual_categories"),
         )
         if req.debug:
+            print("[DEBUG] /api/chat parsed_pipeline_options", {
+                "trace_id": trace_id,
+                "pipeline": pipeline_payload,
+            })
+            debug_picker = result.get("debug_picker") if isinstance(result, dict) else {}
+            if not isinstance(debug_picker, dict):
+                debug_picker = {}
+            debug_pipeline = result.get("debug_pipeline") if isinstance(result, dict) else {}
+            if not isinstance(debug_pipeline, dict):
+                debug_pipeline = {}
+            print("[DEBUG] /api/chat picker_vs_manifest", {
+                "trace_id": trace_id,
+                "manifest.categories.keys()": debug_manifest_keys,
+                "picked_curr": debug_picker.get("picked_curr", {}),
+                "selected_categories": debug_picker.get("selected_categories", result.get("selected_categories")),
+            })
+            print("[DEBUG] /api/chat pipeline_state", {
+                "trace_id": trace_id,
+                "picked_curr": debug_pipeline.get("picked_curr", debug_picker.get("picked_curr", {})),
+                "selected_categories": debug_pipeline.get("selected_categories", result.get("selected_categories")),
+                "confirm_refine_executed": debug_pipeline.get("confirm_refine_executed", {}),
+                "retrieval_cache_hit": result.get("retrieval_cache_hit"),
+                "all_hits_len": debug_pipeline.get("all_hits_len"),
+                "timings_ms": telemetry.summary().get("timings_ms", {}),
+            })
             print("[DEBUG] /api/chat pipeline result", {
                 "result": result,
                 "answer": result.get("answer"),
-                "selected_categories": result.get("selected_categories"),
                 "warnings": result.get("warnings"),
                 "degrade_steps": result.get("degrade_steps"),
                 "references": result.get("references"),
@@ -345,6 +378,9 @@ async def chat(request: Request):
                 "effective_manual_categories": effective_manual_categories,
                 "raw_top_level_manual_categories": raw_top_level_manual_categories,
                 "raw_pipeline_manual_categories": raw_pipeline_manual_categories,
+                "manifest.categories.keys()": debug_manifest_keys,
+                "picked_curr": debug_picker.get("picked_curr", {}),
+                "selected_categories": result.get("selected_categories"),
             })
 
         PENDING_CONVERSATIONS.pop(conversation_id, None)
