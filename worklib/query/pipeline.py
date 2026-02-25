@@ -72,6 +72,11 @@ def _normalize_question(question: str) -> str:
     return s
 
 
+def _normalize_category(c: str) -> str:
+    first_segment = str(c or "").split("__", 1)[0].strip()
+    return first_segment.upper()
+
+
 def _manifest_version(manifest_path: str) -> str:
     p = Path(manifest_path)
     try:
@@ -367,7 +372,21 @@ def run_pipeline_resilient(
             "pick",
             lambda: _run_with_timeout(pick_timeout, lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, debug), ({}, False))[0],
         )
-        selected_categories = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
+
+        raw_selected = picked_curr.get("selected") or []
+        normalized = [_normalize_category(c) for c in raw_selected]
+
+        if debug:
+            valid_categories = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
+            membership_map = {c: (c in valid_set) for c in raw_selected}
+            print("[DEBUG] run_pipeline_resilient picker_vs_manifest", {
+                "valid_set": valid_categories,
+                "picked_curr": picked_curr,
+                "membership_map": membership_map,
+            })
+
+        # Provisional workaround while model category names and manifest keys are harmonized.
+        selected_categories = [c for c in normalized if c in valid_set][: opts.max_categories]
         if not selected_categories:
             warnings.append("Picker no devolvió categorías válidas; se intentarán categorías manuales.")
     if not selected_categories and manual_categories:
