@@ -55,6 +55,9 @@ class ContinueFrom(BaseModel):
     user_reply: str = ""
     selector_instruction: str = ""
     selected_categories: list[str] = Field(default_factory=list)
+class APIError(BaseModel):
+    error: str
+    detail: str
 
 
 class ChatRequest(BaseModel):
@@ -205,6 +208,12 @@ def chat(req: ChatRequest):
     categories_final = list(confirm.get("categories_final") or [])
     suggested_categories = list(confirm.get("suggested_categories") or [])
     selected_categories = categories_final or suggested_categories or list((picked.get("selected") or [])[:2])
+
+    payload = {
+        "answer": answer,
+        "references": references,
+        "selected_categories": selected_categories,
+    }
 
     if req.debug:
         print(f"[DEBUG] confirm.action={action}")
