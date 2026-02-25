@@ -16,6 +16,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from worklib.config import default_config
 from worklib.ingest import ingest_document
+from worklib.query.confirm import confirm_decision
+from worklib.query.pick import pick_categories
 from worklib.query.pipeline import run_pick_confirm, run_pipeline_resilient
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
 from worklib.store import load_manifest
@@ -90,6 +92,7 @@ class PipelineRequest(BaseModel):
 
 class ContinueFrom(BaseModel):
     stage: str
+    state_token: str | None = None
     user_reply: str = ""
     selector_instruction: str = ""
     selected_categories: list[str] = Field(default_factory=list)
@@ -310,21 +313,12 @@ async def chat(request: Request):
                 }
             return JSONResponse(status_code=400, content=content)
 
-        if req.continue_from and req.continue_from.stage == "confirm_refine":
-            pending = PENDING_CONVERSATIONS.get(conversation_id)
-            if not pending:
-                return JSONResponse(status_code=409, content={"error": "invalid_continuation", "details": "No hay estado pendiente para confirm_refine", "trace_id": trace_id})
-            payload = {
-                "message": pending.get("last_question") or question,
-                "manifest_path": pending.get("manifest_path") or req.manifest_path,
-                "manual_categories": req.continue_from.selected_categories or pending.get("selected_categories") or [],
-            }
-        else:
-            payload = {
-                "message": question,
-                "manifest_path": req.manifest_path,
-                "manual_categories": effective_manual_categories,
-            }
+        continue_confirm = bool(req.continue_from and req.continue_from.stage == "confirm_refine")
+        payload = {
+            "message": question,
+            "manifest_path": req.manifest_path,
+            "manual_categories": effective_manual_categories,
+        }
 
         pipeline_payload = req.pipeline.model_dump(exclude_none=True) if req.pipeline else PipelineRequest().model_dump(exclude_none=True)
         pipeline_payload["use_picker"] = bool(effective_use_picker)
@@ -338,7 +332,95 @@ async def chat(request: Request):
             except Exception as exc:
                 print("[DEBUG] /api/chat manifest_keys_error", str(exc))
 
-        if (not req.continue_from) and bool(pipeline_payload.get("use_confirmer")):
+        if continue_confirm:
+            pending = PENDING_CONVERSATIONS.get(conversation_id)
+            if not pending:
+                return JSONResponse(status_code=409, content={"error": "invalid_continuation", "details": "No hay estado pendiente para confirm_refine", "trace_id": trace_id})
+            if req.continue_from and req.continue_from.state_token and req.continue_from.state_token != pending.get("state_token"):
+                return JSONResponse(status_code=409, content={"error": "invalid_state_token", "details": "El state_token no coincide con el estado pendiente", "trace_id": trace_id})
+
+            confirm_question = str(pending.get("last_question") or question)
+            confirm_manifest_path = pending.get("manifest_path") or req.manifest_path
+            manifest_confirm = load_manifest(_resolve_manifest_path(confirm_manifest_path))
+            valid_categories = list(manifest_confirm.categories.keys()) if isinstance(manifest_confirm.categories, dict) else []
+            valid_set = set(valid_categories)
+            suggested_base = [c for c in (req.continue_from.selected_categories or pending.get("suggested_categories") or pending.get("selected_categories") or []) if c in valid_set]
+            user_reply = (req.continue_from.user_reply or "").strip()
+            if req.debug:
+                print("[DEBUG] CONFIRM_USER_REPLY_RECEIVED", {"trace_id": trace_id, "user_reply": user_reply, "suggested_categories": suggested_base})
+                print("[DEBUG] STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "confirm"})
+
+            confirm_pre = confirm_decision(
+                confirm_question,
+                suggested=suggested_base,
+                valid_categories=valid_categories,
+                user_reply=user_reply,
+                debug=req.debug,
+            )
+            action = str(confirm_pre.get("action") or "REFINE").upper().strip()
+            if action not in {"PASS", "REFINE", "REPHRASE"}:
+                action = "REFINE"
+            if not user_reply and action == "PASS":
+                action = "REFINE"
+            confirm_pre["action"] = action
+            if req.debug:
+                print("[DEBUG] CONFIRM_DECISION", {"trace_id": trace_id, "decision": confirm_pre})
+                print("[DEBUG] STAGE_END", {
+                    "trace_id": trace_id,
+                    "stage_name": "confirm",
+                    "decision.action": action,
+                    "decision.confidence": confirm_pre.get("confidence"),
+                    "decision.message_to_user_present": bool(str(confirm_pre.get("message_to_user") or "").strip()),
+                })
+                print("[DEBUG] CONFIRM_BRANCH", {"trace_id": trace_id, "action": action})
+
+            if action == "PASS":
+                selected_pass = [c for c in (confirm_pre.get("categories_final") or suggested_base) if c in valid_set]
+                payload = {
+                    "message": confirm_question,
+                    "manifest_path": confirm_manifest_path,
+                    "manual_categories": selected_pass,
+                }
+                pipeline_payload["use_confirmer"] = False
+                pipeline_payload["use_picker"] = False
+            else:
+                next_question = confirm_question
+                if action == "REPHRASE":
+                    next_question = str(confirm_pre.get("rephrased_question") or confirm_question).strip() or confirm_question
+                selector_instruction = str(confirm_pre.get("selector_instruction") or "").strip()
+                pick_question = next_question
+                if action == "REFINE" and selector_instruction:
+                    pick_question = f"{next_question}\n\nInstrucción adicional para seleccionar categorías: {selector_instruction}".strip()
+                picked_next = pick_categories(pick_question, manifest_confirm.categories, debug=req.debug)
+                suggested_next = [c for c in (picked_next.get("selected") or []) if c in valid_set][: int(pipeline_payload.get("max_categories", 2) or 2)]
+                if not suggested_next:
+                    suggested_next = suggested_base[: int(pipeline_payload.get("max_categories", 2) or 2)]
+
+                state_token = uuid.uuid4().hex[:12]
+                PENDING_CONVERSATIONS[conversation_id] = {
+                    "state_token": state_token,
+                    "last_question": next_question,
+                    "manifest_path": confirm_manifest_path,
+                    "picked": picked_next,
+                    "selected_categories": suggested_next,
+                    "suggested_categories": suggested_next,
+                }
+                if req.debug:
+                    print("[DEBUG] CONFIRM_STATE_TOKEN_CREATED", {"trace_id": trace_id, "conversation_id": conversation_id, "state_token": state_token})
+                return JSONResponse(status_code=200, content={
+                    "status": "needs_confirmation",
+                    "trace_id": trace_id,
+                    "conversation_id": conversation_id,
+                    "state_token": state_token,
+                    "question": next_question,
+                    "suggested_categories": suggested_next,
+                    "picked_curr": picked_next,
+                    "confirm": confirm_pre,
+                    "confirm_prompt": str(confirm_pre.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar."),
+                    "message": str(confirm_pre.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar."),
+                })
+
+        elif bool(pipeline_payload.get("use_confirmer")):
             pre = run_pick_confirm(
                 payload["message"],
                 manifest_path=payload.get("manifest_path"),
@@ -347,15 +429,23 @@ async def chat(request: Request):
             )
             picked_pre = pre.get("picked") or {}
             confirm_pre = pre.get("confirm") or {}
-            suggested = list(confirm_pre.get("categories_final") or confirm_pre.get("suggested_categories") or picked_pre.get("selected") or [])
+            suggested = list(confirm_pre.get("suggested_categories") or picked_pre.get("selected") or [])
+            action = str(confirm_pre.get("action") or "REFINE").upper().strip()
+            if action == "PASS":
+                action = "REFINE"
+                confirm_pre["action"] = "REFINE"
             valid_manifest_path = pre.get("manifest_path") or payload.get("manifest_path")
+            state_token = uuid.uuid4().hex[:12]
             PENDING_CONVERSATIONS[conversation_id] = {
+                "state_token": state_token,
                 "last_question": payload["message"],
                 "manifest_path": valid_manifest_path,
                 "picked": picked_pre,
                 "selected_categories": suggested,
+                "suggested_categories": suggested,
             }
             if req.debug:
+                print("[DEBUG] CONFIRM_STATE_TOKEN_CREATED", {"trace_id": trace_id, "conversation_id": conversation_id, "state_token": state_token})
                 print("[DEBUG] /api/chat needs_confirmation", {
                     "trace_id": trace_id,
                     "status": "needs_confirmation",
@@ -367,16 +457,14 @@ async def chat(request: Request):
                 "status": "needs_confirmation",
                 "trace_id": trace_id,
                 "conversation_id": conversation_id,
+                "state_token": state_token,
                 "question": payload["message"],
                 "suggested_categories": suggested,
                 "picked_curr": picked_pre,
                 "confirm": confirm_pre,
+                "confirm_prompt": str(confirm_pre.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar."),
                 "message": str(confirm_pre.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar."),
             })
-
-        if req.continue_from and req.continue_from.stage == "confirm_refine":
-            pipeline_payload["use_confirmer"] = False
-
         result = run_pipeline_resilient(
             payload["message"],
             manifest_path=payload.get("manifest_path"),

@@ -777,24 +777,25 @@ def run_pick_confirm(
     if telemetry:
         telemetry.add_event("picked", cache_hit=pick_cache_hit)
 
-    # Non-interactive default optimization: if there is no user reply loop, auto-accept.
+    if debug:
+        eprint(f"[DEBUG] STAGE_BEGIN trace_id={(telemetry.trace_id if telemetry else 'no-trace')} stage_name=confirm")
+    confirm_started = time.perf_counter()
     confirm_data = _timed_stage(
         "confirm",
-        lambda: {
-            "action": "PASS",
-            "categories_final": list((picked.get("selected") or [])[:_env_int("WEBAPP_MAX_CATEGORIES", 2)]),
-            "suggested_categories": list((picked.get("selected") or [])[:_env_int("WEBAPP_MAX_CATEGORIES", 2)]),
-            "selector_instruction": "",
-        },
+        lambda: confirm_once_non_interactive(question, picked=picked, manifest=manifest, use_glimpse=confirm_glimpse, debug=debug),
     )
-
-    if confirm_glimpse:
-        # Keep compatibility hook: allow explicit confirm policy via env.
-        if os.getenv("WEBAPP_FORCE_CONFIRM", "0") == "1":
-            confirm_data = _timed_stage(
-                "confirm",
-                lambda: confirm_once_non_interactive(question, picked=picked, manifest=manifest, use_glimpse=True, debug=debug),
-            )
+    if debug:
+        eprint(
+            "[DEBUG] STAGE_END",
+            {
+                "trace_id": telemetry.trace_id if telemetry else "no-trace",
+                "stage_name": "confirm",
+                "elapsed_ms": round((time.perf_counter() - confirm_started) * 1000, 2),
+                "decision_action": str(confirm_data.get("action") or ""),
+                "decision_confidence": confirm_data.get("confidence"),
+                "decision_message_to_user_present": bool(str(confirm_data.get("message_to_user") or "").strip()),
+            },
+        )
 
     if telemetry:
         telemetry.add_event("confirmed", action=confirm_data.get("action", "PASS"))

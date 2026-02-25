@@ -80,8 +80,11 @@
             <div class="small" v-if="pendingConfirmation.suggestedCategories && pendingConfirmation.suggestedCategories.length">
               Sugeridas: {{ pendingConfirmation.suggestedCategories.join(', ') }}
             </div>
+            <div class="row" style="margin-top:8px;">
+              <textarea v-model="pendingConfirmation.userReply" rows="2" placeholder="Responde: sí / no, solo X / reformular..."></textarea>
+            </div>
             <div class="row inline" style="margin-top:8px;">
-              <button @click="confirmPendingCategories" :disabled="loadingChat">Confirmar y continuar</button>
+              <button @click="confirmPendingCategories" :disabled="loadingChat">Enviar confirmación</button>
               <button @click="cancelPendingConfirmation" :disabled="loadingChat">Cancelar</button>
             </div>
           </div>
@@ -224,6 +227,7 @@
             uploadOk: false,
             pendingConfirmation: null,
             pendingConversationId: null,
+            pendingStateToken: null,
             pendingQuestion: "",
           };
         },
@@ -485,11 +489,13 @@
               if (this.debugMode) console.log('[DEBUG_CHAT_RESPONSE]', data);
               if (data.status === 'needs_confirmation') {
                 this.pendingConversationId = data.conversation_id || null;
-                this.pendingQuestion = q;
+                this.pendingStateToken = data.state_token || null;
+                this.pendingQuestion = data.question || q;
                 this.pendingConfirmation = {
-                  message: data.message || 'Confirma las categorías sugeridas para continuar.',
+                  message: data.confirm_prompt || data.message || 'Confirma las categorías sugeridas para continuar.',
                   suggestedCategories: data.suggested_categories || [],
                   picked: data.picked_curr || {},
+                  userReply: '',
                 };
                 this.messages.push({
                   role: 'bot',
@@ -531,9 +537,10 @@
               payload.conversation_id = this.pendingConversationId;
               payload.continue_from = {
                 stage: 'confirm_refine',
+                state_token: this.pendingStateToken || null,
                 selected_categories: this.pendingConfirmation.suggestedCategories || [],
                 selector_instruction: '',
-                user_reply: '',
+                user_reply: (this.pendingConfirmation.userReply || '').trim(),
               };
               // avoid asking confirmation twice after user accepted
               if (payload.pipeline) payload.pipeline.use_confirmer = false;
@@ -545,19 +552,42 @@
               });
               const data = await r.json();
               if (!r.ok) throw new Error(this.extractError(data, 'Error continuando chat'));
-              this.messages.push({
-                role: 'bot',
-                text: data.answer || '(sin respuesta)',
-                selectedCategories: data.selected_categories || [],
-                references: data.references || [],
-                warnings: data.warnings || [],
-                timings: this.debugMode ? data.timings_ms || null : null,
-              });
-              this.pendingConfirmation = null;
-              this.pendingConversationId = null;
-              this.pendingQuestion = '';
-              this.currentStageLabel = 'done';
-              this.scrollChatToBottom();
+              if (data.status === 'needs_confirmation') {
+                this.pendingConversationId = data.conversation_id || this.pendingConversationId;
+                this.pendingStateToken = data.state_token || null;
+                this.pendingQuestion = data.question || this.pendingQuestion;
+                this.pendingConfirmation = {
+                  message: data.confirm_prompt || data.message || 'Confirma las categorías sugeridas para continuar.',
+                  suggestedCategories: data.suggested_categories || [],
+                  picked: data.picked_curr || {},
+                  userReply: '',
+                };
+                this.messages.push({
+                  role: 'bot',
+                  text: data.confirm_prompt || data.message || 'Se requiere una nueva confirmación de categorías.',
+                  selectedCategories: data.suggested_categories || [],
+                  references: [],
+                  warnings: [],
+                  timings: this.debugMode ? data.timings_ms || null : null,
+                });
+                this.currentStageLabel = 'confirm';
+                this.scrollChatToBottom();
+              } else {
+                this.messages.push({
+                  role: 'bot',
+                  text: data.answer || '(sin respuesta)',
+                  selectedCategories: data.selected_categories || [],
+                  references: data.references || [],
+                  warnings: data.warnings || [],
+                  timings: this.debugMode ? data.timings_ms || null : null,
+                });
+                this.pendingConfirmation = null;
+                this.pendingConversationId = null;
+                this.pendingStateToken = null;
+                this.pendingQuestion = '';
+                this.currentStageLabel = 'done';
+                this.scrollChatToBottom();
+              }
             } catch (e) {
               this.messages.push({ role: 'bot', text: `Error: ${e.message || e}`, references: [] });
             } finally {
@@ -567,6 +597,7 @@
           cancelPendingConfirmation() {
             this.pendingConfirmation = null;
             this.pendingConversationId = null;
+            this.pendingStateToken = null;
             this.pendingQuestion = '';
             this.currentStageLabel = 'done';
           },
