@@ -79,8 +79,14 @@ class PipelineRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     use_picker: bool = Field(default=True, validation_alias=AliasChoices("use_picker", "picker", "usePicker"))
-    use_confirmer: bool = Field(default=False, validation_alias=AliasChoices("use_confirmer", "useConfirmer"))
-    use_refiner: bool = Field(default=False, validation_alias=AliasChoices("use_refiner", "useRefiner"))
+    use_confirmer: bool = Field(default=True, validation_alias=AliasChoices("use_confirmer", "useConfirmer"))
+    use_refiner: bool = Field(default=True, validation_alias=AliasChoices("use_refiner", "useRefiner"))
+    refine_a1: bool = True
+    refine_a2: bool = True
+    refine_a3: bool = True
+    use_arbiter: bool = True
+    use_retrieve: bool = True
+    use_write: bool = True
     max_categories: int = Field(default=2, ge=1, le=3)
     top_k: int = Field(default=8, ge=1, le=30)
     max_context_chars: int = Field(default=12000, ge=1000, le=30000)

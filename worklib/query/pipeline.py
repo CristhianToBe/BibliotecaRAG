@@ -54,8 +54,14 @@ class PipelineTimeouts:
 @dataclass
 class PipelineOptions:
     use_picker: bool = True
-    use_confirmer: bool = False
-    use_refiner: bool = False
+    use_confirmer: bool = True
+    use_refiner: bool = True
+    refine_a1: bool = True
+    refine_a2: bool = True
+    refine_a3: bool = True
+    use_arbiter: bool = True
+    use_retrieve: bool = True
+    use_write: bool = True
     max_categories: int = 2
     top_k: int = 8
     max_context_chars: int = 12000
@@ -414,6 +420,12 @@ def _coerce_pipeline_options(raw: Optional[Dict[str, Any]]) -> PipelineOptions:
     opts.use_picker = bool(raw.get("use_picker", opts.use_picker))
     opts.use_confirmer = bool(raw.get("use_confirmer", opts.use_confirmer))
     opts.use_refiner = bool(raw.get("use_refiner", opts.use_refiner))
+    opts.refine_a1 = bool(raw.get("refine_a1", opts.refine_a1))
+    opts.refine_a2 = bool(raw.get("refine_a2", opts.refine_a2))
+    opts.refine_a3 = bool(raw.get("refine_a3", opts.refine_a3))
+    opts.use_arbiter = bool(raw.get("use_arbiter", opts.use_arbiter))
+    opts.use_retrieve = bool(raw.get("use_retrieve", opts.use_retrieve))
+    opts.use_write = bool(raw.get("use_write", opts.use_write))
     opts.max_categories = max(1, min(3, int(raw.get("max_categories", opts.max_categories))))
     opts.top_k = max(1, min(30, int(raw.get("top_k", opts.top_k))))
     opts.max_context_chars = max(1000, min(30000, int(raw.get("max_context_chars", opts.max_context_chars))))
@@ -690,7 +702,7 @@ def run_query(
     pipeline: Optional[Dict[str, Any]] = None,
     manual_categories: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Central orchestrator: pick -> confirm loop -> refine -> retrieve -> write."""
+    """Central orchestrator: pick -> confirm loop -> refine -> arbiter -> retrieve -> write."""
     opts = _coerce_pipeline_options(pipeline)
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
@@ -704,15 +716,26 @@ def run_query(
             base.update(payload)
             print(f"[DEBUG] {label}", base)
 
-    def _stage(stage_name: str, fn: Callable[[], Any]) -> Any:
+    def _stage(stage_name: str, fn: Callable[[], Any], *, meta: Optional[Dict[str, Any]] = None) -> Any:
         _dbg("STAGE_BEGIN", {"stage_name": stage_name})
         started = time.perf_counter()
         with stage_ctx(stage_name):
             out = fn()
-        _dbg("STAGE_END", {"stage_name": stage_name, "next_stage": "pending", "elapsed_ms": round((time.perf_counter()-started)*1000,2)})
+        end_payload = {
+            "stage_name": stage_name,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "next_stage": "pending",
+        }
+        if meta:
+            end_payload.update(meta)
+        _dbg("STAGE_END", end_payload)
         if telemetry:
-            telemetry.mark_stage(stage_name, time.perf_counter()-started)
+            telemetry.mark_stage(stage_name, time.perf_counter() - started)
         return out
+
+    manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
+    if not opts.use_picker and not manual_categories and not (continue_from and continue_from.get("stage") == "confirm_refine"):
+        return {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales.", "trace_id": trace_id}
 
     if continue_from and (continue_from.get("stage") == "confirm_refine"):
         picked_curr = dict((conversation_state or {}).get("picked") or {})
@@ -721,25 +744,43 @@ def run_query(
         user_reply = str(continue_from.get("user_reply") or "")
     else:
         q_curr = question
-        picked_curr = _stage("pick", lambda: pick_stage.run(q_curr, manifest.categories, debug=debug)) if opts.use_picker else {"selected": list(manual_categories or [])}
-        suggested = [c for c in (picked_curr.get("selected") or manual_categories or []) if c in valid_set][:opts.max_categories]
+        if opts.use_picker:
+            picked_curr = _stage("pick", lambda: pick_stage.run(q_curr, manifest.categories, debug=debug))
+            suggested = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
+        else:
+            picked_curr = {"selected": list(manual_categories)}
+            suggested = [c for c in manual_categories if c in valid_set][: opts.max_categories]
         user_reply = ""
 
     if not suggested:
         return {"error": "missing_categories", "trace_id": trace_id}
 
-    confirm_out = _stage(
-        "confirm",
-        lambda: confirm_stage.run(
-            q_curr,
-            picked=picked_curr,
-            manifest=manifest,
-            user_reply=user_reply,
-            suggested_categories=suggested,
-            use_glimpse=True,
-            debug=debug,
-        ),
-    )
+    if opts.use_confirmer:
+        confirm_out = _stage(
+            "confirm",
+            lambda: confirm_stage.run(
+                q_curr,
+                picked=picked_curr,
+                manifest=manifest,
+                user_reply=user_reply,
+                suggested_categories=suggested,
+                use_glimpse=True,
+                debug=debug,
+            ),
+        )
+    else:
+        confirm_out = {
+            "decision": "CONFIRMED",
+            "reason": "confirm_disabled",
+            "rewritten_prompt": "",
+            "categories_final": suggested,
+            "suggested_categories": suggested,
+            "message_to_user": "",
+            "raw": {"action": "PASS"},
+        }
+        _dbg("STAGE_BEGIN", {"stage_name": "confirm"})
+        _dbg("STAGE_END", {"stage_name": "confirm", "elapsed_ms": 0.0, "next_stage": "refine", "reason": "disabled"})
+
     _dbg("CONFIRM_DECISION", {
         "decision": confirm_out.get("decision"),
         "reason": confirm_out.get("reason", ""),
@@ -754,8 +795,8 @@ def run_query(
             "last_question": rewritten,
             "manifest_path": mp,
             "picked": repicked,
-            "suggested_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][:opts.max_categories],
-            "selected_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][:opts.max_categories],
+            "suggested_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
+            "selected_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
         }
         return {
             "status": "needs_confirmation",
@@ -768,42 +809,188 @@ def run_query(
             "message": confirm_out.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar.",
         }
 
-    selected_categories = [c for c in (confirm_out.get("categories_final") or confirm_out.get("suggested_categories") or suggested) if c in valid_set][:opts.max_categories]
+    selected_categories = [
+        c for c in (confirm_out.get("categories_final") or confirm_out.get("suggested_categories") or suggested) if c in valid_set
+    ][: opts.max_categories]
+
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
-    refiners = _stage("refine", lambda: refine_stage.run(q_curr, must_terms, avoid_terms, max_workers=max_workers, debug=debug))
-    refined_queries = [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()]
-    q_final = refined_queries[0] if refined_queries else q_curr
+    enabled_variants: List[str] = []
+    if opts.use_refiner:
+        if opts.refine_a1:
+            enabled_variants.append("A1")
+        if opts.refine_a2:
+            enabled_variants.append("A2")
+        if opts.refine_a3:
+            enabled_variants.append("A3")
+
+    refiners = _stage(
+        "refine",
+        lambda: refine_stage.run(
+            q_curr,
+            must_terms,
+            avoid_terms,
+            max_workers=max_workers,
+            enabled_variants=enabled_variants,
+            debug=debug,
+        ),
+        meta={"variants_enabled": enabled_variants},
+    ) if opts.use_refiner else []
+
+    chosen_candidate: Dict[str, Any]
+    arbiter_meta: Dict[str, Any]
+    if not refiners:
+        chosen_candidate = {"name": "FALLBACK", "query": q_curr, "constraints": {"must_include_terms": must_terms, "avoid_terms": avoid_terms}}
+        arbiter_meta = {"winner": "FALLBACK", "reason": "no_refine_candidates", "considered": []}
+        _dbg("ARBITER_DECISION", arbiter_meta)
+    elif opts.use_arbiter and len(refiners) > 1:
+        arbiter_out = _stage(
+            "arbiter",
+            lambda: arbitrate(
+                q_curr,
+                refiners,
+                [],
+                categories=selected_categories,
+                selector_instruction=str((confirm_out.get("raw") or {}).get("selector_instruction") or ""),
+                debug=debug,
+            ),
+        )
+        chosen_candidate = {
+            "name": arbiter_out.get("chosen_variant_name") or "A1",
+            "query": arbiter_out.get("chosen_query") or q_curr,
+            "constraints": arbiter_out.get("chosen_constraints") or {},
+        }
+        arbiter_meta = {
+            "winner": chosen_candidate.get("name"),
+            "reason": arbiter_out.get("rationale", ""),
+            "considered": arbiter_out.get("considered", []),
+        }
+        _dbg("ARBITER_DECISION", arbiter_meta)
+    else:
+        if opts.use_arbiter:
+            _dbg("STAGE_BEGIN", {"stage_name": "arbiter"})
+            _dbg("STAGE_END", {"stage_name": "arbiter", "elapsed_ms": 0.0, "next_stage": "retrieve", "reason": "single_candidate"})
+        chosen_candidate = refiners[0]
+        arbiter_meta = {
+            "winner": chosen_candidate.get("name", "A1"),
+            "reason": "arbiter_disabled_or_single_candidate",
+            "considered": [r.get("name") for r in refiners],
+        }
+        _dbg("ARBITER_DECISION", arbiter_meta)
+
+    q_final = str(chosen_candidate.get("query") or q_curr)
 
     category_infos = []
     for cname in selected_categories:
         cat = manifest.categories.get(cname)
         category_infos.append({"category": cname, "vector_store_id": str(getattr(cat, "vector_store_id", "") or "")})
 
-    hits = _stage(
-        "retrieve",
-        lambda: _retrieve_by_category(
-            q_final=q_final,
-            refiners=refiners,
-            category_infos=category_infos,
-            max_workers=max_workers,
-            retrieve_timeout_s=_env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 30),
-            top_k=opts.top_k,
-            debug=debug,
-            unbounded=True,
-        ),
-    )
-    hits = attach_local_paths(manifest, merge_and_dedupe_evidence(hits or []), library_root=Path(mp).parent)
-    hits = _shrink_evidence_payload((hits or []), max_hits=5, max_per_hit_chars=1200)
-    hits = _cap_evidence_chars(hits, opts.max_context_chars)
+    hits: List[Dict[str, Any]] = []
+    if opts.use_retrieve:
+        hits = _stage(
+            "retrieve",
+            lambda: _retrieve_by_category(
+                q_final=q_final,
+                refiners=[chosen_candidate],
+                category_infos=category_infos,
+                max_workers=max_workers,
+                retrieve_timeout_s=_env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 30),
+                top_k=opts.top_k,
+                debug=debug,
+                unbounded=True,
+            ),
+            meta={"query_used": q_final},
+        )
+        hits = attach_local_paths(manifest, merge_and_dedupe_evidence(hits or []), library_root=Path(mp).parent)
+        hits = _shrink_evidence_payload((hits or []), max_hits=5, max_per_hit_chars=1200)
+        hits = _cap_evidence_chars(hits, opts.max_context_chars)
+    else:
+        _dbg("STAGE_BEGIN", {"stage_name": "retrieve"})
+        _dbg("STAGE_END", {"stage_name": "retrieve", "elapsed_ms": 0.0, "next_stage": "write", "reason": "disabled"})
 
-    answer = _stage("write", lambda: write_stage.run(q_final, hits, debug=debug))
     refs = _collect_references(manifest, hits)
+    if opts.use_write:
+        answer = _stage("write", lambda: write_stage.run(q_final, hits, debug=debug))
+        status = "ok"
+    else:
+        _dbg("STAGE_BEGIN", {"stage_name": "write"})
+        _dbg("STAGE_END", {"stage_name": "write", "elapsed_ms": 0.0, "next_stage": "done", "reason": "disabled"})
+        status = "ok"
+        answer = "Etapa write deshabilitada por configuración de pipeline."
+
     return {
-        "status": "ok",
+        "status": status,
         "trace_id": trace_id,
         "answer": answer,
         "references": refs,
         "selected_categories": selected_categories,
         "confirm": confirm_out,
+        "chosen_candidate": chosen_candidate,
+        "arbiter": arbiter_meta,
+        "warnings": [] if opts.use_retrieve else ["retrieve_disabled"],
+        "degrade_steps": [] if opts.use_write else ["write_disabled"],
     }
+
+
+def pro_query_non_interactive(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    _ = (confirm_rounds, confirm_glimpse)
+    return run_query(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        pipeline={"use_confirmer": bool(confirm)},
+    )
+
+
+def pro_query_with_meta(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    return pro_query_non_interactive(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        confirm=confirm,
+        confirm_rounds=confirm_rounds,
+        confirm_glimpse=confirm_glimpse,
+    )
+
+
+def pro_query(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> str:
+    return str(
+        pro_query_with_meta(
+            question,
+            manifest_path=manifest_path,
+            max_workers=max_workers,
+            debug=debug,
+            confirm=confirm,
+            confirm_rounds=confirm_rounds,
+            confirm_glimpse=confirm_glimpse,
+        ).get("answer", "")
+    )
