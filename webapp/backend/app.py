@@ -228,6 +228,10 @@ def _normalize_manual_categories(raw: str | list[str] | None) -> list[str]:
     return out
 
 
+def _normalize_picker_category(raw: Any) -> str:
+    return str(raw or "").split("__", 1)[0].strip().upper()
+
+
 @app.get("/api/categories")
 def list_categories(manifest_path: str | None = None) -> dict[str, list[str]]:
     now = time.time()
