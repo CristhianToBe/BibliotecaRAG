@@ -35,3 +35,7 @@ def pick_categories(question: str, cats: Dict[str, Category], *, debug: bool = F
         "must_include_terms": (obj.get("must_include_terms", []) or [])[:10],
         "avoid_terms": (obj.get("avoid_terms", []) or [])[:10],
     }
+
+
+def run(question: str, cats: Dict[str, Category], *, debug: bool = False) -> Dict[str, Any]:
+    return pick_categories(question, cats, debug=debug)

@@ -157,3 +157,6 @@ def retrieve_via_tool(
         eprint(f"\n[DEBUG] retrieve_via_tool: chunks={len(chunks)} workers={workers} results={len(deduped)}")
 
     return deduped
+
+def run(vector_store_ids: List[str], query: str, *, max_num_results: int = 12, debug: bool = False, max_workers: int = 4) -> List[Dict[str, Any]]:
+    return retrieve_via_tool(vector_store_ids, query, max_num_results=max_num_results, debug=debug, max_workers=max_workers)

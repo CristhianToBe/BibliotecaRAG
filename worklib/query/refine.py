@@ -76,3 +76,7 @@ def refine_all(
         reset_telemetry(tele_token)
 
     return [out]
+
+
+def run(question: str, must_include_terms: List[str], avoid_terms: List[str], *, max_workers: int = 3, debug: bool = False) -> List[Dict[str, Any]]:
+    return refine_all(question, must_include_terms, avoid_terms, max_workers=max_workers, debug=debug)

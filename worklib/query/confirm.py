@@ -10,6 +10,62 @@ from .pick import pick_categories
 from .retrieve import retrieve_via_tool
 
 
+def run(
+    question: str,
+    *,
+    picked: Dict[str, Any],
+    manifest: Manifest,
+    user_reply: str = "",
+    suggested_categories: Optional[List[str]] = None,
+    use_glimpse: bool = True,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Single confirmation decision used by pipeline orchestration.
+
+    This is the only place that decides whether categories are confirmed or a
+    repick loop must continue.
+    """
+    valid = list(manifest.categories.keys())
+    valid_set = set(valid)
+    suggested = [
+        c for c in (suggested_categories or picked.get("selected") or []) if c in valid_set
+    ][:2]
+    glimpses: List[Dict[str, Any]] = _build_glimpses(manifest, suggested, question) if (use_glimpse and suggested) else []
+
+    decision = confirm_decision(
+        question,
+        suggested=suggested,
+        valid_categories=valid,
+        glimpses=glimpses,
+        user_reply=(user_reply or "").strip(),
+        debug=debug,
+    )
+    action = str(decision.get("action") or "REFINE").strip().upper()
+
+    pipeline_decision = "REPICK"
+    rewritten_prompt = ""
+    if action == "PASS":
+        pipeline_decision = "CONFIRMED"
+    elif action == "REPHRASE":
+        pipeline_decision = "PARTIAL"
+        rewritten_prompt = str(decision.get("rephrased_question") or "").strip()
+    else:
+        pipeline_decision = "REPICK"
+        selector_instruction = str(decision.get("selector_instruction") or "").strip()
+        if selector_instruction:
+            rewritten_prompt = f"{question}\n\nInstrucción adicional para seleccionar categorías: {selector_instruction}".strip()
+
+    return {
+        "decision": pipeline_decision,
+        "reason": str(decision.get("message_to_user") or decision.get("selector_instruction") or "").strip(),
+        "rewritten_prompt": rewritten_prompt,
+        "categories_final": list(decision.get("categories_final") or []),
+        "suggested_categories": suggested,
+        "message_to_user": str(decision.get("message_to_user") or "").strip(),
+        "raw": decision,
+    }
+
+
 def _safe_json_load(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
     try:
