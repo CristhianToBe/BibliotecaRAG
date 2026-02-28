@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+from contextlib import contextmanager
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -92,3 +93,12 @@ def reset_debug_enabled(token: contextvars.Token[bool]) -> None:
 
 def is_debug_enabled() -> bool:
     return bool(_debug_enabled.get())
+
+
+@contextmanager
+def stage_ctx(stage_name: str):
+    token = set_current_stage(stage_name)
+    try:
+        yield
+    finally:
+        reset_current_stage(token)

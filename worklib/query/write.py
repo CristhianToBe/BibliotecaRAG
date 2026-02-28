@@ -29,3 +29,6 @@ def write_answer(question: str, evidence: List[Dict[str, Any]], *, debug: bool =
         eprint("\n[DEBUG] writer output_text:")
         eprint(txt[:2000])
     return txt
+
+def run(question: str, evidence: List[Dict[str, Any]], *, debug: bool = False) -> str:
+    return write_answer(question, evidence, debug=debug)

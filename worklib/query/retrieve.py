@@ -6,6 +6,7 @@ from .llm import call_text, eprint, safe_get, MODEL_FAST
 from .telemetry import get_current_stage, get_telemetry, is_debug_enabled, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 
 def extract_file_search_results(response_obj: Any, *, debug: bool = False) -> List[Dict[str, Any]]:
@@ -157,3 +158,50 @@ def retrieve_via_tool(
         eprint(f"\n[DEBUG] retrieve_via_tool: chunks={len(chunks)} workers={workers} results={len(deduped)}")
 
     return deduped
+
+def run(vector_store_ids: List[str], query: str, *, max_num_results: int = 12, debug: bool = False, max_workers: int = 4) -> List[Dict[str, Any]]:
+    return retrieve_via_tool(vector_store_ids, query, max_num_results=max_num_results, debug=debug, max_workers=max_workers)
+
+
+def run_variant(
+    *,
+    candidate: str,
+    query: str,
+    constraints: Dict[str, Any],
+    vector_store_ids: List[str],
+    top_k: int,
+    max_workers: int,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    telemetry = get_telemetry()
+    trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
+    started = time.perf_counter()
+    if debug:
+        eprint("[DEBUG] RETRIEVAL_VARIANT_BEGIN", {
+            "trace_id": trace_id,
+            "candidate": candidate,
+            "query": query,
+        })
+    hits = retrieve_via_tool(
+        vector_store_ids,
+        query,
+        max_num_results=top_k,
+        debug=debug,
+        max_workers=max_workers,
+    )
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+    if debug:
+        eprint("[DEBUG] RETRIEVAL_VARIANT_END", {
+            "trace_id": trace_id,
+            "candidate": candidate,
+            "hits_count": len(hits),
+            "elapsed_ms": elapsed_ms,
+        })
+    return {
+        "candidate": candidate,
+        "query_used": query,
+        "constraints": dict(constraints or {}),
+        "hits": hits,
+        "hits_count": len(hits),
+        "elapsed_ms": elapsed_ms,
+    }

@@ -8,6 +8,81 @@ from worklib.store import Manifest
 from .llm import MODEL_CONFIRM, SYSTEM_CONFIRM, call_text, clip, eprint
 from .pick import pick_categories
 from .retrieve import retrieve_via_tool
+from .confirm_rules import enforce_confirm_schema, fallback_clarification, strip_category_mentions, route_confirm_action
+from .telemetry import get_telemetry
+
+
+def run(
+    question: str,
+    *,
+    picked: Dict[str, Any],
+    manifest: Manifest,
+    user_reply: str = "",
+    suggested_categories: Optional[List[str]] = None,
+    use_glimpse: bool = True,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Single confirmation decision used by pipeline orchestration.
+
+    This is the only place that decides whether categories are confirmed or a
+    repick loop must continue.
+    """
+    valid = list(manifest.categories.keys())
+    telemetry = get_telemetry()
+    trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
+    if debug:
+        eprint("[DEBUG] CONFIRM_ENTER", {"trace_id": trace_id})
+    valid_set = set(valid)
+    suggested = [
+        c for c in (suggested_categories or picked.get("selected") or []) if c in valid_set
+    ][:2]
+    glimpses: List[Dict[str, Any]] = _build_glimpses(manifest, suggested, question) if (use_glimpse and suggested) else []
+
+    decision = confirm_decision(
+        question,
+        suggested=suggested,
+        valid_categories=valid,
+        glimpses=glimpses,
+        user_reply=(user_reply or "").strip(),
+        debug=debug,
+    )
+    if debug:
+        eprint("[DEBUG] CONFIRM_INPUT", {
+            "trace_id": trace_id,
+            "suggested_categories": suggested,
+            "user_reply": (user_reply or ""),
+        })
+    action = str(decision.get("action") or "REFINE").strip().upper()
+
+    pipeline_decision = "REPICK"
+    rewritten_prompt = ""
+    if action == "PASS":
+        pipeline_decision = "CONFIRMED"
+    elif action == "REPHRASE":
+        pipeline_decision = "PARTIAL"
+        rewritten_prompt = str(decision.get("rephrased_question") or "").strip()
+    else:
+        pipeline_decision = "REPICK"
+        selector_instruction = str(decision.get("selector_instruction") or "").strip()
+        if selector_instruction:
+            rewritten_prompt = f"{question}\n\nInstrucción adicional para seleccionar categorías: {selector_instruction}".strip()
+
+    out = {
+        "decision": pipeline_decision,
+        "reason": str(decision.get("message_to_user") or decision.get("selector_instruction") or "").strip(),
+        "rewritten_prompt": rewritten_prompt,
+        "suggested_categories": suggested,
+        "message_to_user": str(decision.get("message_to_user") or "").strip(),
+        "raw": decision,
+    }
+    if debug:
+        eprint("[DEBUG] CONFIRM_OUTPUT", {
+            "trace_id": trace_id,
+            "action": str((decision or {}).get("action") or ""),
+            "categories_final": None,
+            "pipeline_decision": pipeline_decision,
+        })
+    return out
 
 
 def _safe_json_load(s: str) -> Dict[str, Any]:
@@ -38,34 +113,30 @@ def confirm_decision(
         "glimpses": glimpses or [],
         "user_reply": user_reply,
     }
-    resp = call_text(MODEL_CONFIRM, SYSTEM_CONFIRM, json.dumps(payload, ensure_ascii=False), debug=debug)
-    txt = resp.output_text or ""
-    if debug:
-        eprint("\n[DEBUG] confirm_decision raw output_text:")
-        eprint(txt)
-
+    obj: Dict[str, Any] = {}
     try:
+        resp = call_text(MODEL_CONFIRM, SYSTEM_CONFIRM, json.dumps(payload, ensure_ascii=False), debug=debug)
+        txt = resp.output_text or ""
+        if debug:
+            eprint("\n[DEBUG] confirm_decision raw output_text:")
+            eprint(txt)
         obj = _safe_json_load(txt)
     except Exception:
         obj = {}
 
-    action = str(obj.get("action", "REFINE")).strip().upper()
-    if action not in ("PASS", "REFINE", "REPHRASE"):
-        action = "REFINE"
+    if not isinstance(obj, dict):
+        obj = {}
 
-    valid_set = set(valid_categories)
-    cats_final = [c for c in (obj.get("categories_final") or []) if c in valid_set]
-    if action == "PASS" and not cats_final:
-        cats_final = [c for c in suggested if c in valid_set]
+    if not obj:
+        normalized = fallback_clarification()
+    else:
+        normalized = enforce_confirm_schema(obj, user_reply=user_reply)
 
-    return {
-        "message_to_user": str(obj.get("message_to_user", "") or "").strip(),
-        "action": action,
-        "categories_final": cats_final,
-        "selector_instruction": str(obj.get("selector_instruction", "") or "").strip(),
-        "rephrased_question": str(obj.get("rephrased_question", "") or "").strip(),
-        "confidence": float(obj.get("confidence", 0.0) or 0.0),
-    }
+    normalized["message_to_user"] = strip_category_mentions(
+        str(normalized.get("message_to_user") or ""),
+        [*suggested, *valid_categories],
+    )
+    return normalized
 
 
 def _build_glimpses(
@@ -152,7 +223,7 @@ def confirm_loop(
 
         action = decision["action"]
         if action == "PASS":
-            return (q_curr, decision["categories_final"], picked_curr)
+            return (q_curr, suggested, picked_curr)
 
         if action == "REFINE":
             instr = decision.get("selector_instruction", "")
@@ -223,19 +294,10 @@ def confirm_loop_non_interactive(
     )
 
     action = str(decision.get("action") or "REFINE").strip().upper()
-    cats_final = list(decision.get("categories_final") or [])
-    valid_set = set(valid)
-    cats_final = [c for c in cats_final if c in valid_set]
     if debug:
         eprint(f"[DEBUG] non-interactive confirm action: {action}")
-        eprint(f"[DEBUG] non-interactive confirm categories_final: {cats_final}")
 
-    # Non-interactive policy: never block on actions requiring user input.
-    # Always continue with best available categories.
-    if not cats_final:
-        cats_final = [c for c in suggested if c in valid_set]
-
-
+    cats_final = [c for c in suggested if c in set(valid)]
     if debug:
         eprint(f"[DEBUG] non-interactive chosen categories after fallback: {cats_final}")
 

@@ -15,15 +15,26 @@ from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
-from .confirm import confirm_once_non_interactive
+from .arbiter_utils import choose_variant_name
+from .intent_hints import detect_domain_hint, apply_domain_hint_constraints
+from .pipeline_guards import manifest_not_loaded_response
+from . import confirm as confirm_stage
 from .llm import eprint
 from .paths import resolve_local_path
-from .pick import pick_categories
-from .refine import refine_all
-from .retrieve import retrieve_via_tool
-from .telemetry import RequestTelemetry, get_telemetry, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry
-from .write import write_answer
+from . import pick as pick_stage
+from . import refine as refine_stage
+from . import retrieve as retrieve_stage
+from .telemetry import RequestTelemetry, get_telemetry, reset_current_stage, reset_debug_enabled, reset_telemetry, set_current_stage, set_debug_enabled, set_telemetry, stage_ctx
+from . import write as write_stage
 
+
+
+# Backward-compat aliases for existing tests/patch points
+pick_categories = pick_stage.run
+refine_all = refine_stage.run
+retrieve_via_tool = retrieve_stage.run
+write_answer = write_stage.run
+confirm_loop = confirm_stage.confirm_loop
 
 _PICK_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _RETRIEVAL_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
@@ -46,8 +57,14 @@ class PipelineTimeouts:
 @dataclass
 class PipelineOptions:
     use_picker: bool = True
-    use_confirmer: bool = False
-    use_refiner: bool = False
+    use_confirmer: bool = True
+    use_refiner: bool = True
+    refine_a1: bool = True
+    refine_a2: bool = True
+    refine_a3: bool = True
+    use_arbiter: bool = True
+    use_retrieve: bool = True
+    use_write: bool = True
     max_categories: int = 2
     top_k: int = 8
     max_context_chars: int = 12000
@@ -365,6 +382,72 @@ def _retrieve_quick_fallback(
     return out
 
 
+def _retrieve_candidate_package(
+    *,
+    candidate: Dict[str, Any],
+    manifest: Manifest,
+    manifest_path: str,
+    selected_categories: List[str],
+    top_k: int,
+    max_workers: int,
+    max_context_chars: int,
+    debug: bool,
+) -> Dict[str, Any]:
+    telemetry = get_telemetry()
+    trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
+    candidate_name = str(candidate.get("name") or "A1")
+    q_used = str(candidate.get("query") or "")
+    constraints = dict(candidate.get("constraints") or {})
+    doc_counts = _count_docs_by_category(manifest)
+    category_infos: List[Dict[str, Any]] = []
+    for cname in selected_categories:
+        cat = manifest.categories.get(cname)
+        vs_id = str(getattr(cat, "vector_store_id", "") or "")
+        category_infos.append({"category": cname, "vector_store_id": vs_id, "docs": int(doc_counts.get(cname, 0))})
+
+    if debug:
+        print("[DEBUG] RETRIEVAL_VARIANT_BEGIN", {
+            "trace_id": trace_id,
+            "candidate": candidate_name,
+            "query_used": q_used,
+            "categories": selected_categories,
+        })
+
+    started = time.perf_counter()
+    hits = _retrieve_by_category(
+        q_final=q_used,
+        refiners=[candidate],
+        category_infos=category_infos,
+        max_workers=max_workers,
+        retrieve_timeout_s=_env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 30),
+        top_k=top_k,
+        debug=debug,
+        unbounded=True,
+    )
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+
+    hits = attach_local_paths(manifest, merge_and_dedupe_evidence(hits or []), library_root=Path(manifest_path).parent)
+    hits = _shrink_evidence_payload((hits or []), max_hits=8, max_per_hit_chars=1200)
+    hits = _cap_evidence_chars(hits, max_context_chars)
+
+    if debug:
+        print("[DEBUG] RETRIEVAL_VARIANT_END", {
+            "trace_id": trace_id,
+            "candidate": candidate_name,
+            "hits_count": len(hits),
+            "elapsed_ms": elapsed_ms,
+        })
+
+    return {
+        "candidate": candidate_name,
+        "query_used": q_used,
+        "constraints": constraints,
+        "hits": hits,
+        "hits_count": len(hits),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: float, debug: bool) -> Tuple[Dict[str, Any], bool]:
     key = _normalize_question(question)
     cached = _cache_get(_PICK_CACHE, key)
@@ -406,6 +489,12 @@ def _coerce_pipeline_options(raw: Optional[Dict[str, Any]]) -> PipelineOptions:
     opts.use_picker = bool(raw.get("use_picker", opts.use_picker))
     opts.use_confirmer = bool(raw.get("use_confirmer", opts.use_confirmer))
     opts.use_refiner = bool(raw.get("use_refiner", opts.use_refiner))
+    opts.refine_a1 = bool(raw.get("refine_a1", opts.refine_a1))
+    opts.refine_a2 = bool(raw.get("refine_a2", opts.refine_a2))
+    opts.refine_a3 = bool(raw.get("refine_a3", opts.refine_a3))
+    opts.use_arbiter = bool(raw.get("use_arbiter", opts.use_arbiter))
+    opts.use_retrieve = bool(raw.get("use_retrieve", opts.use_retrieve))
+    opts.use_write = bool(raw.get("use_write", opts.use_write))
     opts.max_categories = max(1, min(3, int(raw.get("max_categories", opts.max_categories))))
     opts.top_k = max(1, min(30, int(raw.get("top_k", opts.top_k))))
     opts.max_context_chars = max(1000, min(30000, int(raw.get("max_context_chars", opts.max_context_chars))))
@@ -421,344 +510,15 @@ def run_pipeline_resilient(
     pipeline: Optional[Dict[str, Any]] = None,
     manual_categories: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    opts = _coerce_pipeline_options(pipeline)
-    warnings: List[str] = []
-    degrade_steps: List[str] = []
-    manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
-
-    mp = manifest_path or _default_manifest_path()
-    manifest = load_manifest(Path(mp))
-    valid_set = set(manifest.categories.keys())
-
-    telemetry = get_telemetry()
-    trace_id = getattr(telemetry, "trace_id", "no-trace")
-    debug_pipeline: Dict[str, Any] = {"trace_id": trace_id, "stages": {}, "query_evolution": {}, "unbounded": opts.unbounded}
-
-    def _debug_log(label: str, payload: Dict[str, Any]) -> None:
-        if not debug:
-            return
-        base = {"trace_id": trace_id}
-        base.update(payload)
-        print(f"[DEBUG] {label}", base)
-
-    def _stage_begin(stage_name: str, *, skipped: bool = False, reason: str = "") -> float:
-        t0 = time.perf_counter()
-        _debug_log("STAGE_BEGIN", {
-            "stage_name": stage_name,
-            "start_ts": t0,
-            "skipped": skipped,
-            "reason": reason,
-        })
-        return t0
-
-    def _stage_end(stage_name: str, *, started_at: float, skipped: bool = False, degraded: bool = False, reason: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
-        t1 = time.perf_counter()
-        payload: Dict[str, Any] = {
-            "stage_name": stage_name,
-            "start_ts": started_at,
-            "end_ts": t1,
-            "elapsed_ms": round((t1 - started_at) * 1000, 2),
-            "skipped": skipped,
-            "degraded": degraded,
-            "reason": reason,
-        }
-        if extra:
-            payload.update(extra)
-        debug_pipeline["stages"][stage_name] = payload
-        _debug_log("STAGE_END", payload)
-
-    def _run_stage(stage_name: str, fn: Callable[[], Any], fallback: Any) -> Tuple[Any, str]:
-        started_at = _stage_begin(stage_name)
-        calls_before = telemetry.model_calls if telemetry else 0
-        task_started = time.perf_counter()
-        result_used = "stage_output"
-        try:
-            tele_token = set_telemetry(telemetry)
-            stage_token = set_current_stage(stage_name)
-            debug_token = set_debug_enabled(debug)
-            try:
-                value = fn()
-            finally:
-                reset_debug_enabled(debug_token)
-                reset_current_stage(stage_token)
-                reset_telemetry(tele_token)
-        except Exception as exc:
-            value = fallback
-            result_used = "fallback"
-            warnings.append(f"Fallo en etapa {stage_name}: {type(exc).__name__}")
-            _debug_log("STAGE_ERROR", {"stage_name": stage_name, "error": str(exc)})
-        task_elapsed_s = max(0.0, time.perf_counter() - task_started)
-        if telemetry:
-            telemetry.mark_stage(stage_name, task_elapsed_s)
-        calls_after = telemetry.model_calls if telemetry else calls_before
-        _stage_end(
-            stage_name,
-            started_at=started_at,
-            reason="ok" if result_used == "stage_output" else "fallback_exception",
-            extra={
-                "llm_calls_made": max(0, calls_after - calls_before),
-                "stage_result_used": result_used,
-                "task_elapsed_ms": round(task_elapsed_s * 1000, 2),
-            },
-        )
-        return value, result_used
-
-    if not opts.use_picker and not manual_categories:
-        out = {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales."}
-        if debug:
-            out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": {}, "selected_categories": []}
-            out["debug_pipeline"] = debug_pipeline
-        return out
-
-    selected_categories: List[str] = []
-    picked_curr: Dict[str, Any] = {}
-    pick_ttl_s = _env_float("WEBAPP_PICK_CACHE_TTL_S", 600)
-
-    if opts.use_picker:
-        _debug_log("PICK_INPUT_SUMMARY", {
-            "user_len": len(question or ""),
-            "model": os.getenv("MODEL_PICK", "gpt-5-nano"),
-            "valid_set_len": len(valid_set),
-        })
-        pick_result, _ = _run_stage("pick", lambda: _pick_with_cache(question, manifest.categories, pick_ttl_s, False), ({}, False))
-        picked_curr = pick_result[0] if isinstance(pick_result, tuple) else {}
-        raw_selected = picked_curr.get("selected") or []
-        if debug:
-            _debug_log("PICKER_MATCH", {
-                "valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [],
-                "picked_curr": picked_curr,
-                "membership_map": {c: (c in valid_set) for c in raw_selected},
-            })
-        selected_categories = [c for c in raw_selected if c in valid_set][: opts.max_categories]
-        if not selected_categories and raw_selected:
-            valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
-            expanded: List[str] = []
-            for token in [_top_category_token(c) for c in raw_selected]:
-                expanded.extend([k for k in valid_keys if _top_category_token(k) == token])
-            selected_categories = _dedupe_preserve_order(expanded)[: opts.max_categories]
-        if not selected_categories:
-            valid_keys = list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else []
-            selected_categories = _fallback_pick_categories(question, valid_keys, opts.max_categories)
-            if selected_categories:
-                _debug_log("PICK_FALLBACK_USED", {"strategy": "heuristic_defaults", "selected_categories": selected_categories})
-    else:
-        s0 = _stage_begin("pick", skipped=True, reason="disabled")
-        if telemetry:
-            telemetry.mark_stage("pick", 0.0)
-        _stage_end("pick", started_at=s0, skipped=True, reason="disabled")
-
-    if not selected_categories and manual_categories:
-        selected_categories = [c for c in manual_categories if c in valid_set][: opts.max_categories]
-
-    if not selected_categories:
-        out = {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales."}
-        if debug:
-            out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": picked_curr, "selected_categories": selected_categories}
-            out["debug_pipeline"] = debug_pipeline
-        return out
-
-    confirm_data: Dict[str, Any] = {}
-    if opts.use_confirmer and selected_categories:
-        confirm_data, _ = _run_stage(
-            "confirm",
-            lambda: confirm_once_non_interactive(question, picked=picked_curr, manifest=manifest, use_glimpse=False, debug=False),
-            {"categories_final": selected_categories, "suggested_categories": selected_categories},
-        )
-        selected_categories = [c for c in (confirm_data.get("categories_final") or confirm_data.get("suggested_categories") or selected_categories) if c in valid_set][: opts.max_categories]
-    else:
-        s0 = _stage_begin("confirm", skipped=True, reason="disabled_or_no_categories")
-        if telemetry:
-            telemetry.mark_stage("confirm", 0.0)
-        _stage_end("confirm", started_at=s0, skipped=True, reason="disabled_or_no_categories")
-
-    must_terms = list(picked_curr.get("must_include_terms", []) or [])
-    avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
-    q_final = question
-
-    refiners: List[Dict[str, Any]] = []
-    if opts.use_refiner:
-        refiners, _ = _run_stage("refine", lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False), [])
-    else:
-        s0 = _stage_begin("refine", skipped=True, reason="disabled")
-        if telemetry:
-            telemetry.mark_stage("refine", 0.0)
-        _stage_end("refine", started_at=s0, skipped=True, reason="disabled")
-
-    refined_queries = [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()]
-    if refined_queries:
-        q_final = refined_queries[0]
-
-    debug_pipeline["query_evolution"] = {
-        "original_question": question,
-        "refined_queries": refined_queries,
-        "final_query_for_retrieval": q_final,
-        "selector_instruction": str(confirm_data.get("selector_instruction") or ""),
-        "must_include_terms": must_terms,
-        "avoid_terms": avoid_terms,
-    }
-    _debug_log("QUERY_EVOLUTION", debug_pipeline["query_evolution"])
-
-    doc_counts = _count_docs_by_category(manifest)
-    category_infos: List[Dict[str, Any]] = []
-    for cname in selected_categories[: opts.max_categories]:
-        cat = manifest.categories.get(cname)
-        vs_id = str(getattr(cat, "vector_store_id", "") or "").strip() if cat else ""
-        category_infos.append({"category": cname, "vector_store_id": vs_id, "docs": int(doc_counts.get(cname, 0)), "vs_exists": bool(vs_id)})
-
-    retrieval_key = hashlib.sha1(
-        json.dumps({"q": _normalize_question(q_final), "cats": [x["category"] for x in category_infos], "manifest": _manifest_version(mp)}, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    all_hits = _cache_get(_RETRIEVAL_CACHE, retrieval_key)
-    retrieval_cache_hit = all_hits is not None
-    cached_hits_count = len(all_hits) if isinstance(all_hits, list) else 0
-    _debug_log("CACHE_LOOKUP", {
-        "cache": "retrieval",
-        "cache_key_sha1": retrieval_key,
-        "cache_hit": retrieval_cache_hit,
-        "cached_object_type": type(all_hits).__name__ if all_hits is not None else "NoneType",
-        "cached_hits_count": cached_hits_count,
-        "cached_payload_size": len(json.dumps(all_hits, ensure_ascii=False)) if all_hits is not None else 0,
-    })
-
-    if retrieval_cache_hit and cached_hits_count == 0:
-        _debug_log("CACHE_HIT_EMPTY", {"cache_key_sha1": retrieval_key, "action": "treat_as_miss_and_execute_retrieval"})
-        retrieval_cache_hit = False
-        all_hits = None
-
-    if all_hits is None:
-        _debug_log("RETRIEVAL_EXECUTED", {
-            "categories": [x.get("category") for x in category_infos],
-            "category_infos": category_infos,
-            "queries": [q_final] + [str(r.get("query") or "").strip() for r in refiners if str(r.get("query") or "").strip()],
-            "top_k": opts.top_k,
-        })
-        all_hits, retrieval_result_used = _run_stage(
-            "retrieval",
-            lambda: _retrieve_by_category(
-                q_final=q_final,
-                refiners=refiners,
-                category_infos=category_infos,
-                max_workers=max_workers,
-                retrieve_timeout_s=opts.timeouts.retrieve_per_cat_s,
-                top_k=opts.top_k,
-                debug=debug,
-                unbounded=opts.unbounded,
-            ),
-            [],
-        )
-        if retrieval_result_used != "stage_output" and not all_hits:
-            all_hits = _retrieve_quick_fallback(q_final=q_final, category_infos=category_infos, top_k=opts.top_k, max_workers=max_workers, debug=debug)
-            _debug_log("RETRIEVAL_FALLBACK_USED", {"reason": "stage_exception", "returned_candidates": len(all_hits or [])})
-        _cache_set(_RETRIEVAL_CACHE, retrieval_key, list(all_hits or []), _env_float("WEBAPP_RETRIEVAL_CACHE_TTL_S", 1800))
-    else:
-        s0 = _stage_begin("retrieval", skipped=True, reason="cache_hit")
-        if telemetry:
-            telemetry.mark_stage("retrieval", 0.0)
-        _debug_log("RETRIEVAL_SKIPPED", {"reason": "cache_hit", "cached_hits_count": len(all_hits or [])})
-        _stage_end("retrieval", started_at=s0, skipped=True, reason="cache_hit", extra={"hits_len": len(all_hits or [])})
-
-    all_hits = attach_local_paths(manifest, merge_and_dedupe_evidence(all_hits or []), library_root=Path(mp).parent)
-    all_hits = _shrink_evidence_payload((all_hits or []), max_hits=5, max_per_hit_chars=1200)
-    all_hits = _cap_evidence_chars(all_hits, opts.max_context_chars)
-    references = _collect_references(manifest, all_hits)
-
-    retrieval_degraded = False
-    if telemetry:
-        status_map = telemetry.summary().get("retrieval_status_by_category", {})
-        retrieval_degraded = any(v in ("failed",) for v in status_map.values()) if opts.unbounded else any(v in ("timeout", "failed", "timeout_over_budget_kept_hits") for v in status_map.values())
-        if retrieval_degraded and all_hits and (not opts.unbounded):
-            warnings.append("Retrieval parcial: al menos una categoría agotó tiempo o falló.")
-
-    if debug:
-        timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
-        print("[DEBUG] run_pipeline_resilient snapshot", {
-            "trace_id": trace_id,
-            "selected_categories": selected_categories,
-            "category_infos": [{"category": x.get("category"), "docs": x.get("docs"), "vs_exists": x.get("vs_exists")} for x in category_infos],
-            "retrieval_cache_hit": retrieval_cache_hit,
-            "all_hits_len": len(all_hits or []),
-            "timings_ms": {
-                "pick": timings.get("pick"),
-                "confirm": timings.get("confirm"),
-                "refine": timings.get("refine"),
-                "retrieval": timings.get("retrieval"),
-                "answer_generation": timings.get("answer_generation"),
-            },
-        })
-
-    if not all_hits:
-        warning = "No se recuperó evidencia del repositorio en esta ejecución (0 fragmentos)."
-        warnings.append(warning)
-
-    answer, writer_result_used = _run_stage("answer_generation", lambda: write_answer(q_final, all_hits, debug=debug), "")
-    _debug_log("WRITER_STATUS", {"writer_result_used": writer_result_used})
-
-    if debug:
-        print("[DEBUG] run_pipeline_resilient answer", {
-            "trace_id": trace_id,
-            "answer_len": len(answer or ""),
-            "answer_preview": str(answer or "")[:220],
-            "warnings": warnings,
-            "degrade_steps": degrade_steps,
-        })
-
-    if not answer:
-        if all_hits:
-            warning = f"No alcancé a redactar la respuesta completa dentro del tiempo, pero sí recuperé {len(all_hits)} fragmentos."
-            warnings.append(warning)
-            refs_top = references[:3]
-            excerpts = [str(h.get("text") or "").strip()[:300] for h in (all_hits or [])[:3] if str(h.get("text") or "").strip()]
-            refs_lines = [f"- {r.get('filename') or 'sin_nombre'} ({r.get('abs_path') or 'sin_ruta'})" for r in refs_top]
-            ex_lines = [f"- {x}" for x in excerpts]
-            answer = warning + "\n\nReferencias principales:\n" + ("\n".join(refs_lines) if refs_lines else "- (sin referencias)") + "\n\nExtractos:\n" + ("\n".join(ex_lines) if ex_lines else "- (sin extractos)")
-        else:
-            warning = "No se recuperó evidencia del repositorio en esta ejecución (0 fragmentos)."
-            warnings.append(warning)
-            labels = ", ".join(selected_categories) if selected_categories else "sin categorías"
-            answer = f"{warning}\n\nResumen rápido: {question}\nCategorías consideradas: {labels}."
-
-    if debug:
-        timings = telemetry.summary().get("timings_ms", {}) if telemetry else {}
-        print("[DEBUG] run_pipeline_resilient done", {
-            "trace_id": trace_id,
-            "timings_ms": {
-                "pick": timings.get("pick"),
-                "confirm": timings.get("confirm"),
-                "refine": timings.get("refine"),
-                "retrieval": timings.get("retrieval"),
-                "answer_generation": timings.get("answer_generation"),
-            },
-            "selected_categories": selected_categories,
-            "category_infos": [{"category": x.get("category"), "docs": x.get("docs"), "vs_exists": x.get("vs_exists")} for x in category_infos],
-            "retrieval_cache_hit": retrieval_cache_hit,
-            "all_hits_len": len(all_hits or []),
-            "warnings": warnings,
-            "degrade_steps": degrade_steps,
-        })
-
-    out = {
-        "status": "ok",
-        "answer": answer,
-        "references": references,
-        "selected_categories": selected_categories,
-        "warnings": warnings,
-        "degrade_steps": degrade_steps,
-        "retrieval_cache_hit": retrieval_cache_hit,
-    }
-    if debug:
-        out["debug_picker"] = {"valid_set": list(manifest.categories.keys()) if isinstance(manifest.categories, dict) else [], "picked_curr": picked_curr, "selected_categories": selected_categories}
-        out["debug_pipeline"] = debug_pipeline
-        out["debug_pipeline"].update({
-            "picked_curr": picked_curr,
-            "selected_categories": selected_categories,
-            "all_hits_len": len(all_hits or []),
-            "retrieval_degraded": retrieval_degraded,
-            "confirm_refine_executed": {
-                "confirm": bool(debug_pipeline["stages"].get("confirm") and not debug_pipeline["stages"]["confirm"].get("skipped")),
-                "refine": bool(debug_pipeline["stages"].get("refine") and not debug_pipeline["stages"]["refine"].get("skipped")),
-            },
-        })
-    return out
+    """Backward-compatible wrapper around the centralized query orchestrator."""
+    return run_query(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        pipeline=pipeline,
+        manual_categories=manual_categories,
+    )
 
 
 def run_pick_confirm(
@@ -782,7 +542,7 @@ def run_pick_confirm(
     confirm_started = time.perf_counter()
     confirm_data = _timed_stage(
         "confirm",
-        lambda: confirm_once_non_interactive(question, picked=picked, manifest=manifest, use_glimpse=confirm_glimpse, debug=debug),
+        lambda: confirm_stage.confirm_once_non_interactive(question, picked=picked, manifest=manifest, use_glimpse=confirm_glimpse, debug=debug),
     )
     if debug:
         eprint(
@@ -839,12 +599,21 @@ def run_after_confirm(
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
+    hinted = apply_domain_hint_constraints(
+        domain_hint=domain_hint,
+        must_terms=must_terms,
+        avoid_terms=avoid_terms,
+        query_text=q_curr,
+    )
+    must_terms = list(hinted.get("must_terms") or [])
+    avoid_terms = list(hinted.get("avoid_terms") or [])
+    q_curr = str(hinted.get("query_text") or q_curr)
 
     refiners = _timed_stage(
         "refine",
         lambda: _run_with_timeout(
             retrieve_timeout_s,
-            lambda: refine_all(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False),
+            lambda: refine_stage.run(q_final, must_terms, avoid_terms, max_workers=max_workers, debug=False),
             [{"name": "A?", "query": q_final, "constraints": {"prefer_norma_first": True}}],
         ),
     )
@@ -876,7 +645,7 @@ def run_after_confirm(
                 retrieve_timeout_s=retrieve_timeout_s,
                 top_k=top_k,
                 debug=debug,
-                unbounded=opts.unbounded,
+                unbounded=True,
             ),
         )
         if not all_hits:
@@ -940,9 +709,7 @@ def pro_query_non_interactive(
     pre = run_pick_confirm(question, manifest_path=manifest_path, debug=debug, confirm_glimpse=confirm_glimpse if confirm else False)
     picked = dict(pre.get("picked") or {})
     confirm_data = dict(pre.get("confirm") or {})
-    selected_categories = list(confirm_data.get("categories_final") or [])
-    if not selected_categories:
-        selected_categories = list(confirm_data.get("suggested_categories") or [])
+    selected_categories = list(confirm_data.get("suggested_categories") or [])
 
     out = run_after_confirm(
         question,
@@ -954,6 +721,472 @@ def pro_query_non_interactive(
     )
     out["pick_cache_hit"] = bool(pre.get("pick_cache_hit"))
     return out
+
+
+def pro_query_with_meta(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    return pro_query_non_interactive(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        confirm=confirm,
+        confirm_rounds=confirm_rounds,
+        confirm_glimpse=confirm_glimpse,
+    )
+
+
+def pro_query(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> str:
+    return str(
+        pro_query_with_meta(
+            question,
+            manifest_path=manifest_path,
+            max_workers=max_workers,
+            debug=debug,
+            confirm=confirm,
+            confirm_rounds=confirm_rounds,
+            confirm_glimpse=confirm_glimpse,
+        ).get("answer", "")
+    )
+
+
+def run_query(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    continue_from: Optional[Dict[str, Any]] = None,
+    conversation_state: Optional[Dict[str, Any]] = None,
+    pipeline: Optional[Dict[str, Any]] = None,
+    manual_categories: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Central orchestrator: pick -> confirm loop -> refine -> retrieve(by variant) -> arbiter -> write."""
+    opts = _coerce_pipeline_options(pipeline)
+    mp = manifest_path or _default_manifest_path()
+    telemetry = get_telemetry()
+    try:
+        manifest = load_manifest(Path(mp))
+        manifest_error = ""
+    except Exception as exc:
+        manifest = Manifest(categories={}, docs={})
+        manifest_error = f"{type(exc).__name__}: {exc}"
+    valid_set = set(manifest.categories.keys()) if isinstance(getattr(manifest, "categories", None), dict) else set()
+    trace_id = getattr(telemetry, "trace_id", "no-trace")
+
+    if debug:
+        print("[DEBUG] MANIFEST_STATE", {
+            "trace_id": trace_id,
+            "where": "manifest_load",
+            "manifest_path": str(mp),
+            "categories_count": len(valid_set),
+            "categories_sample": list(valid_set)[:5],
+        })
+
+    def _dbg(label: str, payload: Dict[str, Any]) -> None:
+        if debug:
+            base = {"trace_id": trace_id}
+            base.update(payload)
+            print(f"[DEBUG] {label}", base)
+
+    def _stage(stage_name: str, fn: Callable[[], Any], *, meta: Optional[Dict[str, Any]] = None) -> Any:
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": stage_name})
+        started = time.perf_counter()
+        with stage_ctx(stage_name):
+            out = fn()
+        end_payload = {
+            "trace_id": trace_id,
+            "stage_name": stage_name,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "next_stage": "pending",
+        }
+        if meta:
+            end_payload.update(meta)
+        _dbg("STAGE_END", end_payload)
+        if telemetry:
+            telemetry.mark_stage(stage_name, time.perf_counter() - started)
+        return out
+
+    if (not valid_set):
+        if debug:
+            _dbg("MANIFEST_GUARD", {
+                "manifest_path": str(mp),
+                "valid_categories_len": 0,
+                "manifest_error": manifest_error,
+            })
+        out = manifest_not_loaded_response(
+            trace_id=trace_id,
+            manifest_path=str(mp),
+            manifest_error=manifest_error,
+        )
+        out["reason"] = "manifest_empty"
+        return out
+
+    manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
+    category_source = "unknown"
+    if not opts.use_picker and not manual_categories and not (continue_from and continue_from.get("stage") == "confirm_refine"):
+        return {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales.", "trace_id": trace_id}
+
+    if continue_from and (continue_from.get("stage") == "confirm_refine"):
+        picked_curr = dict((conversation_state or {}).get("picked") or {})
+        q_curr = str((conversation_state or {}).get("last_question") or question or "")
+        suggested = [c for c in ((continue_from.get("selected_categories") or (conversation_state or {}).get("suggested_categories") or [])) if c in valid_set]
+        user_reply = str(continue_from.get("user_reply") or "")
+        domain_hint = str((conversation_state or {}).get("domain_hint") or detect_domain_hint(q_curr) or "")
+        category_source = "state"
+    else:
+        q_curr = question
+        domain_hint = detect_domain_hint(q_curr)
+        if opts.use_picker:
+            if debug:
+                _dbg("MANIFEST_STATE", {
+                    "where": "before_pick",
+                    "categories_count": len(valid_set),
+                    "categories_sample": list(valid_set)[:5],
+                })
+            picked_curr = _stage("pick", lambda: pick_stage.run(q_curr, manifest.categories, debug=debug))
+            if debug:
+                _dbg("PICK_OUTPUT_FULL", {"raw_pick_output": picked_curr})
+            suggested = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
+            category_source = "pick"
+            if debug:
+                _dbg("PICK_AFTER_FILTER", {"picked_curr": picked_curr, "selected_categories": suggested})
+        else:
+            picked_curr = {"selected": list(manual_categories)}
+            suggested = [c for c in manual_categories if c in valid_set][: opts.max_categories]
+            category_source = "manual"
+        user_reply = ""
+
+    if not suggested:
+        return {"error": "missing_categories", "trace_id": trace_id}
+
+    if opts.use_confirmer:
+        if debug:
+            _dbg("CONFIRM_INVOKE", {"invoked": True})
+            _dbg("MANIFEST_STATE", {
+                "where": "before_confirm",
+                "categories_count": len(valid_set),
+                "categories_sample": list(valid_set)[:5],
+            })
+        confirm_out = _stage(
+            "confirm",
+            lambda: confirm_stage.run(
+                q_curr,
+                picked=picked_curr,
+                manifest=manifest,
+                user_reply=user_reply,
+                suggested_categories=suggested,
+                use_glimpse=True,
+                debug=debug,
+            ),
+        )
+    else:
+        if debug:
+            _dbg("CONFIRM_INVOKE", {"invoked": False, "reason": "disabled"})
+        confirm_out = {
+            "decision": "CONFIRMED",
+            "reason": "confirm_disabled",
+            "rewritten_prompt": "",
+            "suggested_categories": suggested,
+            "message_to_user": "",
+            "raw": {"action": "PASS"},
+        }
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "confirm"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "confirm", "elapsed_ms": 0.0, "next_stage": "refine", "reason": "disabled"})
+
+    _dbg("CONFIRM_DECISION", {
+        "trace_id": trace_id,
+        "decision": confirm_out.get("decision"),
+        "reason": confirm_out.get("reason", ""),
+        "rewritten_prompt": confirm_out.get("rewritten_prompt") or "",
+    })
+
+    if confirm_out.get("decision") == "AWAITING_USER_REPLY":
+        state = {
+            "last_question": q_curr,
+            "manifest_path": mp,
+            "picked": picked_curr,
+            "suggested_categories": suggested,
+            "selected_categories": suggested,
+            "domain_hint": domain_hint,
+        }
+        return {
+            "status": "needs_confirmation",
+            "trace_id": trace_id,
+            "question": q_curr,
+            "picked_curr": picked_curr,
+            "confirm": confirm_out,
+        "domain_hint": domain_hint,
+            "suggested_categories": suggested,
+            "reason": str(confirm_out.get("reason") or ""),
+            "state": state,
+            "awaiting_user_reply": True,
+            "message": confirm_out.get("message_to_user") or "Confirma o ajusta el enfoque antes de continuar.",
+        }
+
+    if confirm_out.get("decision") in {"REPICK", "PARTIAL"}:
+        rewritten = str(confirm_out.get("rewritten_prompt") or q_curr).strip() or q_curr
+        _dbg("LOOP_REPICK_TRIGGERED", {"trace_id": trace_id})
+        repicked = _stage("pick", lambda: pick_stage.run(rewritten, manifest.categories, debug=debug))
+        category_source = "confirm"
+        state = {
+            "last_question": rewritten,
+            "manifest_path": mp,
+            "picked": repicked,
+            "suggested_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
+            "selected_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
+            "domain_hint": domain_hint,
+        }
+        return {
+            "status": "needs_confirmation",
+            "trace_id": trace_id,
+            "question": rewritten,
+            "picked_curr": repicked,
+            "confirm": confirm_out,
+        "domain_hint": domain_hint,
+            "suggested_categories": state["suggested_categories"],
+            "reason": str(confirm_out.get("reason") or ""),
+            "state": state,
+            "message": confirm_out.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar.",
+        }
+
+    selected_categories = [c for c in (confirm_out.get("suggested_categories") or suggested) if c in valid_set][: opts.max_categories]
+    if category_source == "unknown":
+        category_source = "fallback"
+    if debug:
+        _dbg("CATEGORY_SOURCE", {"source": category_source})
+
+    must_terms = list(picked_curr.get("must_include_terms", []) or [])
+    avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
+    hinted = apply_domain_hint_constraints(
+        domain_hint=domain_hint,
+        must_terms=must_terms,
+        avoid_terms=avoid_terms,
+        query_text=q_curr,
+    )
+    must_terms = list(hinted.get("must_terms") or [])
+    avoid_terms = list(hinted.get("avoid_terms") or [])
+    q_curr = str(hinted.get("query_text") or q_curr)
+    enabled_variants: List[str] = []
+    if opts.use_refiner:
+        if opts.refine_a1:
+            enabled_variants.append("A1")
+        if opts.refine_a2:
+            enabled_variants.append("A2")
+        if opts.refine_a3:
+            enabled_variants.append("A3")
+
+    refiners = _stage(
+        "refine",
+        lambda: refine_stage.run(
+            q_curr,
+            must_terms,
+            avoid_terms,
+            max_workers=max_workers,
+            enabled_variants=enabled_variants,
+            debug=debug,
+        ),
+        meta={"variants_enabled": enabled_variants},
+    ) if opts.use_refiner else []
+
+    if not refiners:
+        refiners = [{"name": "A1", "query": q_curr, "constraints": {"must_include_terms": must_terms, "avoid_terms": avoid_terms}}]
+        enabled_variants = ["A1"]
+        _dbg("REFINE_FALLBACK", {"trace_id": trace_id, "reason": "no_candidates_from_refine"})
+
+    retrieval_by_variant: Dict[str, Dict[str, Any]] = {}
+    if opts.use_retrieve:
+        if debug:
+            _dbg("MANIFEST_STATE", {
+                "where": "before_retrieve",
+                "categories_count": len(valid_set),
+                "categories_sample": list(valid_set)[:5],
+            })
+        def _run_variant_retrieve(candidate: Dict[str, Any]) -> Dict[str, Any]:
+            return _retrieve_candidate_package(
+                candidate=candidate,
+                manifest=manifest,
+                manifest_path=mp,
+                selected_categories=selected_categories,
+                top_k=opts.top_k,
+                max_workers=max_workers,
+                max_context_chars=opts.max_context_chars,
+                debug=debug,
+            )
+
+        variant_packages = _stage(
+            "retrieve",
+            lambda: [_run_variant_retrieve(c) for c in refiners],
+            meta={"variants": [str(c.get("name") or "A1") for c in refiners]},
+        )
+        retrieval_by_variant = {str(p.get("candidate") or "A1"): p for p in variant_packages}
+    else:
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "retrieve"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "retrieve", "elapsed_ms": 0.0, "next_stage": "write", "reason": "disabled"})
+
+    considered_variants = [str(x.get("name") or "A1") for x in refiners]
+    signal_summary: Dict[str, Dict[str, Any]] = {}
+    for candidate in refiners:
+        name = str(candidate.get("name") or "A1")
+        pkg = retrieval_by_variant.get(name, {})
+        hits = list(pkg.get("hits") or [])
+        constraints = dict(candidate.get("constraints") or {})
+        must_terms = [str(x).strip().lower() for x in (constraints.get("must_include_terms") or []) if str(x).strip()]
+        corpus = "\n".join(str(h.get("text") or "").lower() for h in hits)
+        matched = sum(1 for term in must_terms if term and term in corpus)
+        coverage = (matched / max(1, len(must_terms))) if must_terms else 1.0
+        unique_docs = len({str(h.get("doc_id") or h.get("file_id") or h.get("filename") or "") for h in hits if (h.get("doc_id") or h.get("file_id") or h.get("filename"))})
+        signal_summary[name] = {
+            "hits_count": int(pkg.get("hits_count") or 0),
+            "unique_docs": int(unique_docs),
+            "must_terms_coverage": round(float(coverage), 3),
+        }
+
+    chosen_variant_name = choose_variant_name(signal_summary, considered_variants)
+    chosen_candidate = next((c for c in refiners if str(c.get("name") or "A1") == chosen_variant_name), refiners[0])
+    chosen_hits: List[Dict[str, Any]] = list((retrieval_by_variant.get(chosen_variant_name) or {}).get("hits") or [])
+
+    _dbg("VARIANT_CHOSEN", {
+        "trace_id": trace_id,
+        "name": chosen_variant_name,
+        "reason": "max(must_terms_coverage,unique_docs,hits_count)",
+        "signal_summary": signal_summary,
+    })
+
+    arbiter_meta: Dict[str, Any] = {
+        "winner": chosen_variant_name,
+        "reason": "variant_deterministic_signals",
+        "considered": considered_variants,
+        "signal_summary": signal_summary,
+        "selected_indexes": [],
+        "also_indexes": [],
+    }
+
+    if opts.use_retrieve and opts.use_arbiter:
+        if chosen_hits:
+            arbiter_out = _stage(
+                "arbiter",
+                lambda: arbitrate(
+                    q_curr,
+                    [],
+                    chosen_hits,
+                    categories=selected_categories,
+                    selector_instruction=str((confirm_out.get("raw") or {}).get("selector_instruction") or ""),
+                    debug=debug,
+                ),
+            )
+            selected_indexes = [i for i in (arbiter_out.get("selected_indexes") or []) if isinstance(i, int) and 0 <= i < len(chosen_hits)]
+            also_indexes = [i for i in (arbiter_out.get("also_indexes") or []) if isinstance(i, int) and 0 <= i < len(chosen_hits) and i not in selected_indexes]
+            if not selected_indexes:
+                selected_indexes = list(range(min(3, len(chosen_hits))))
+            chosen_hits = [chosen_hits[i] for i in selected_indexes + [i for i in also_indexes if i not in selected_indexes]]
+            arbiter_meta = {
+                "winner": chosen_variant_name,
+                "reason": str(arbiter_out.get("why") or "selected_by_evidence_arbiter"),
+                "considered": considered_variants,
+                "signal_summary": signal_summary,
+                "selected_indexes": selected_indexes,
+                "also_indexes": also_indexes,
+            }
+        else:
+            _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "no_evidence_for_chosen_variant", "winner": chosen_variant_name})
+        _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
+    elif not opts.use_retrieve:
+        if opts.use_arbiter:
+            _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "retrieve_disabled"})
+        arbiter_meta.update({"reason": "retrieve_disabled"})
+    else:
+        _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "disabled", "winner": chosen_variant_name})
+        arbiter_meta.update({"reason": "disabled"})
+
+    q_final = str(chosen_candidate.get("query") or q_curr)
+    refs = _collect_references(manifest, chosen_hits)
+
+    if opts.use_write:
+        _dbg("WRITE_INPUT", {
+            "trace_id": trace_id,
+            "winner": arbiter_meta.get("winner"),
+            "chosen_candidate_name": str(chosen_candidate.get("name") or ""),
+            "chosen_hits_count": len(chosen_hits),
+            "chosen_query_used": q_final,
+        })
+        answer = _stage("write", lambda: write_stage.run(q_final, chosen_hits, debug=debug))
+        status = "ok"
+    else:
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "write"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "write", "elapsed_ms": 0.0, "next_stage": "done", "reason": "disabled"})
+        status = "ok"
+        answer = "Etapa write deshabilitada por configuración de pipeline."
+
+    if debug:
+        _dbg("FINAL_CATEGORY_DECISION", {
+            "manifest_count": len(valid_set),
+            "picked_curr": picked_curr,
+            "selected_categories": selected_categories,
+            "confirm_action": str((confirm_out.get("raw") or {}).get("action") or ""),
+            "category_source": category_source,
+        })
+
+    return {
+        "status": status,
+        "trace_id": trace_id,
+        "answer": answer,
+        "references": refs,
+        "selected_categories": selected_categories,
+        "confirm": confirm_out,
+        "domain_hint": domain_hint,
+        "chosen_candidate": chosen_candidate,
+        "chosen_candidate_hits_count": len(chosen_hits),
+        "arbiter": arbiter_meta,
+        "variants_enabled": enabled_variants,
+        "retrieval_by_variant": {
+            name: {
+                "hits_count": int(pkg.get("hits_count") or 0),
+                "elapsed_ms": pkg.get("elapsed_ms"),
+                "query_used": pkg.get("query_used"),
+            }
+            for name, pkg in retrieval_by_variant.items()
+        },
+        "warnings": [] if opts.use_retrieve else ["retrieve_disabled"],
+        "degrade_steps": [] if opts.use_write else ["write_disabled"],
+    }
+
+
+def pro_query_non_interactive(
+    question: str,
+    *,
+    manifest_path: Optional[str] = None,
+    max_workers: int = 3,
+    debug: bool = False,
+    confirm: bool = True,
+    confirm_rounds: int = 4,
+    confirm_glimpse: bool = True,
+) -> Dict[str, Any]:
+    _ = (confirm_rounds, confirm_glimpse)
+    return run_query(
+        question,
+        manifest_path=manifest_path,
+        max_workers=max_workers,
+        debug=debug,
+        pipeline={"use_confirmer": bool(confirm)},
+    )
 
 
 def pro_query_with_meta(

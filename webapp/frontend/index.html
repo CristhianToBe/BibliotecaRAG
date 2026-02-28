@@ -94,9 +94,15 @@
 
         <section class="card">
           <h2>Ajustes</h2>
-          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_picker" /> Picker</label></div>
-          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_confirmer" /> Confirmer / Árbitro</label></div>
-          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_refiner" /> Refiner</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_picker" /> Pick</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_confirmer" /> Confirm</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_refiner" /> Refine</label></div>
+          <div class="row" style="padding-left:12px;"><label class="toggle"><input type="checkbox" v-model="settings.refine_a1" :disabled="!settings.use_refiner" /> Refine A1</label></div>
+          <div class="row" style="padding-left:12px;"><label class="toggle"><input type="checkbox" v-model="settings.refine_a2" :disabled="!settings.use_refiner" /> Refine A2</label></div>
+          <div class="row" style="padding-left:12px;"><label class="toggle"><input type="checkbox" v-model="settings.refine_a3" :disabled="!settings.use_refiner" /> Refine A3</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_arbiter" /> Árbitro</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_retrieve" /> Retrieve</label></div>
+          <div class="row"><label class="toggle"><input type="checkbox" v-model="settings.use_write" /> Write</label></div>
           <div class="row"><label class="toggle"><input type="checkbox" v-model="multiCategory" /> Multi-categoría</label></div>
           <div class="row inline">
             <button @click="applyFastMode">Modo rápido</button>
@@ -209,8 +215,14 @@
             lastCategoryEvent: null,
             settings: {
               use_picker: true,
-              use_confirmer: false,
-              use_refiner: false,
+              use_confirmer: true,
+              use_refiner: true,
+              refine_a1: true,
+              refine_a2: true,
+              refine_a3: true,
+              use_arbiter: true,
+              use_retrieve: true,
+              use_write: true,
               max_categories: 2,
               top_k: 8,
               max_context_chars: 12000,
@@ -395,8 +407,14 @@
             this.selectedManualCategories = this.selectedManualCategories.filter((item) => item !== category);
           },
           applyFastMode() {
-            this.settings.use_confirmer = false;
-            this.settings.use_refiner = false;
+            this.settings.use_confirmer = true;
+            this.settings.use_refiner = true;
+            this.settings.refine_a1 = true;
+            this.settings.refine_a2 = false;
+            this.settings.refine_a3 = false;
+            this.settings.use_arbiter = false;
+            this.settings.use_retrieve = true;
+            this.settings.use_write = true;
             this.multiCategory = false;
             this.settings.max_categories = 1;
             this.settings.top_k = 4;
@@ -405,6 +423,12 @@
           applyFullMode() {
             this.settings.use_confirmer = true;
             this.settings.use_refiner = true;
+            this.settings.refine_a1 = true;
+            this.settings.refine_a2 = true;
+            this.settings.refine_a3 = true;
+            this.settings.use_arbiter = true;
+            this.settings.use_retrieve = true;
+            this.settings.use_write = true;
             this.multiCategory = true;
             this.settings.max_categories = 2;
             this.settings.top_k = 8;
@@ -432,6 +456,12 @@
                 use_picker: !!this.settings.use_picker,
                 use_confirmer: !!this.settings.use_confirmer,
                 use_refiner: !!this.settings.use_refiner,
+                refine_a1: !!this.settings.refine_a1,
+                refine_a2: !!this.settings.refine_a2,
+                refine_a3: !!this.settings.refine_a3,
+                use_arbiter: !!this.settings.use_arbiter,
+                use_retrieve: !!this.settings.use_retrieve,
+                use_write: !!this.settings.use_write,
                 max_categories: Number(this.settings.max_categories),
                 top_k: Number(this.settings.top_k),
                 unbounded: !!this.settings.unbounded,
@@ -467,7 +497,7 @@
               const controller = new AbortController();
               const timeoutMs = this.settings.unbounded ? null : Math.max(10000, (this.settings.timeouts.total_s + 10) * 1000);
               const timeoutId = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
-              const stageSteps = ['pick', 'confirm', 'refine', 'retrieving', 'answering'];
+              const stageSteps = ['pick', 'confirm', 'refine', 'arbiter', 'retrieve', 'write'];
               let idx = 0;
               this.currentStageLabel = stageSteps[idx];
               this.stageTicker = setInterval(() => {
@@ -542,8 +572,6 @@
                 selector_instruction: '',
                 user_reply: (this.pendingConfirmation.userReply || '').trim(),
               };
-              // avoid asking confirmation twice after user accepted
-              if (payload.pipeline) payload.pipeline.use_confirmer = false;
               if (this.debugMode) console.log('[DEBUG_CHAT_CONTINUE_PAYLOAD]', JSON.stringify(payload));
               const r = await fetch(apiUrl('/api/chat'), {
                 method: 'POST',
