@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from worklib.config import default_config
+from worklib.versioning import resolve_manifest_path
 from worklib.ingest import ingest_document
 from worklib.query.pipeline import run_query
 from worklib.query.telemetry import RequestTelemetry, reset_telemetry, set_telemetry
@@ -201,9 +202,7 @@ def _log_trace(summary: dict[str, Any], *, degrade_steps: list[str] | None = Non
 
 
 def _resolve_manifest_path(manifest_path: str | None) -> Path:
-    if manifest_path:
-        return Path(manifest_path).expanduser().resolve()
-    return Path(os.getenv("RAG_MANIFEST_PATH") or os.getenv("WORKLIB_MANIFEST_PATH") or str(default_config().manifest_path)).resolve()
+    return resolve_manifest_path(manifest_path)
 
 
 def _normalize_manual_categories(raw: str | list[str] | None) -> list[str]:

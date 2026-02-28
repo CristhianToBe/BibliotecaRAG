@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from worklib.versioning import get_biblioteca_root, resolve_manifest_path
+
 
 @dataclass(frozen=True)
 class Config:
@@ -29,13 +31,10 @@ def default_config() -> Config:
     3) Si no, usa Path.cwd()
     """
 
-    here = Path(__file__).resolve().parent
-
-    root = (_env_path("WORKLIB_ROOT") or (here / "Biblioteca") if (here / "Biblioteca").exists() else Path.cwd()).resolve()
-
+    root = (_env_path("WORKLIB_ROOT") or get_biblioteca_root()).resolve()
     library_dir = (_env_path("WORKLIB_LIBRARY_DIR") or (root / "biblioteca")).resolve()
     state_dir = (_env_path("WORKLIB_STATE_DIR") or (root / "_state")).resolve()
-    manifest_path = (_env_path("WORKLIB_MANIFEST_PATH") or (state_dir / "library.json")).resolve()
+    manifest_path = resolve_manifest_path(_env_path("WORKLIB_MANIFEST_PATH"))
 
     return Config(root=root, library_dir=library_dir, state_dir=state_dir, manifest_path=manifest_path)
 
