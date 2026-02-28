@@ -698,9 +698,7 @@ def pro_query_non_interactive(
     pre = run_pick_confirm(question, manifest_path=manifest_path, debug=debug, confirm_glimpse=confirm_glimpse if confirm else False)
     picked = dict(pre.get("picked") or {})
     confirm_data = dict(pre.get("confirm") or {})
-    selected_categories = list(confirm_data.get("categories_final") or [])
-    if not selected_categories:
-        selected_categories = list(confirm_data.get("suggested_categories") or [])
+    selected_categories = list(confirm_data.get("suggested_categories") or [])
 
     out = run_after_confirm(
         question,
@@ -841,7 +839,6 @@ def run_query(
             "decision": "CONFIRMED",
             "reason": "confirm_disabled",
             "rewritten_prompt": "",
-            "categories_final": suggested,
             "suggested_categories": suggested,
             "message_to_user": "",
             "raw": {"action": "PASS"},
@@ -879,9 +876,7 @@ def run_query(
             "message": confirm_out.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar.",
         }
 
-    selected_categories = [
-        c for c in (confirm_out.get("categories_final") or confirm_out.get("suggested_categories") or suggested) if c in valid_set
-    ][: opts.max_categories]
+    selected_categories = [c for c in (confirm_out.get("suggested_categories") or suggested) if c in valid_set][: opts.max_categories]
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])

@@ -8,6 +8,7 @@ from worklib.store import Manifest
 from .llm import MODEL_CONFIRM, SYSTEM_CONFIRM, call_text, clip, eprint
 from .pick import pick_categories
 from .retrieve import retrieve_via_tool
+from .confirm_rules import enforce_confirm_schema, fallback_clarification, strip_category_mentions
 
 
 def run(
@@ -59,7 +60,6 @@ def run(
         "decision": pipeline_decision,
         "reason": str(decision.get("message_to_user") or decision.get("selector_instruction") or "").strip(),
         "rewritten_prompt": rewritten_prompt,
-        "categories_final": list(decision.get("categories_final") or []),
         "suggested_categories": suggested,
         "message_to_user": str(decision.get("message_to_user") or "").strip(),
         "raw": decision,
@@ -94,34 +94,30 @@ def confirm_decision(
         "glimpses": glimpses or [],
         "user_reply": user_reply,
     }
-    resp = call_text(MODEL_CONFIRM, SYSTEM_CONFIRM, json.dumps(payload, ensure_ascii=False), debug=debug)
-    txt = resp.output_text or ""
-    if debug:
-        eprint("\n[DEBUG] confirm_decision raw output_text:")
-        eprint(txt)
-
+    obj: Dict[str, Any] = {}
     try:
+        resp = call_text(MODEL_CONFIRM, SYSTEM_CONFIRM, json.dumps(payload, ensure_ascii=False), debug=debug)
+        txt = resp.output_text or ""
+        if debug:
+            eprint("\n[DEBUG] confirm_decision raw output_text:")
+            eprint(txt)
         obj = _safe_json_load(txt)
     except Exception:
         obj = {}
 
-    action = str(obj.get("action", "REFINE")).strip().upper()
-    if action not in ("PASS", "REFINE", "REPHRASE"):
-        action = "REFINE"
+    if not isinstance(obj, dict):
+        obj = {}
 
-    valid_set = set(valid_categories)
-    cats_final = [c for c in (obj.get("categories_final") or []) if c in valid_set]
-    if action == "PASS" and not cats_final:
-        cats_final = [c for c in suggested if c in valid_set]
+    if not obj:
+        normalized = fallback_clarification()
+    else:
+        normalized = enforce_confirm_schema(obj, user_reply=user_reply)
 
-    return {
-        "message_to_user": str(obj.get("message_to_user", "") or "").strip(),
-        "action": action,
-        "categories_final": cats_final,
-        "selector_instruction": str(obj.get("selector_instruction", "") or "").strip(),
-        "rephrased_question": str(obj.get("rephrased_question", "") or "").strip(),
-        "confidence": float(obj.get("confidence", 0.0) or 0.0),
-    }
+    normalized["message_to_user"] = strip_category_mentions(
+        str(normalized.get("message_to_user") or ""),
+        [*suggested, *valid_categories],
+    )
+    return normalized
 
 
 def _build_glimpses(
@@ -208,7 +204,7 @@ def confirm_loop(
 
         action = decision["action"]
         if action == "PASS":
-            return (q_curr, decision["categories_final"], picked_curr)
+            return (q_curr, suggested, picked_curr)
 
         if action == "REFINE":
             instr = decision.get("selector_instruction", "")
@@ -279,19 +275,10 @@ def confirm_loop_non_interactive(
     )
 
     action = str(decision.get("action") or "REFINE").strip().upper()
-    cats_final = list(decision.get("categories_final") or [])
-    valid_set = set(valid)
-    cats_final = [c for c in cats_final if c in valid_set]
     if debug:
         eprint(f"[DEBUG] non-interactive confirm action: {action}")
-        eprint(f"[DEBUG] non-interactive confirm categories_final: {cats_final}")
 
-    # Non-interactive policy: never block on actions requiring user input.
-    # Always continue with best available categories.
-    if not cats_final:
-        cats_final = [c for c in suggested if c in valid_set]
-
-
+    cats_final = [c for c in suggested if c in set(valid)]
     if debug:
         eprint(f"[DEBUG] non-interactive chosen categories after fallback: {cats_final}")
 
