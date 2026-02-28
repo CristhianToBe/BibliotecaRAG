@@ -791,6 +791,15 @@ def run_query(
     valid_set = set(manifest.categories.keys()) if isinstance(getattr(manifest, "categories", None), dict) else set()
     trace_id = getattr(telemetry, "trace_id", "no-trace")
 
+    if debug:
+        print("[DEBUG] MANIFEST_STATE", {
+            "trace_id": trace_id,
+            "where": "manifest_load",
+            "manifest_path": str(mp),
+            "categories_count": len(valid_set),
+            "categories_sample": list(valid_set)[:5],
+        })
+
     def _dbg(label: str, payload: Dict[str, Any]) -> None:
         if debug:
             base = {"trace_id": trace_id}
@@ -822,13 +831,16 @@ def run_query(
                 "valid_categories_len": 0,
                 "manifest_error": manifest_error,
             })
-        return manifest_not_loaded_response(
+        out = manifest_not_loaded_response(
             trace_id=trace_id,
             manifest_path=str(mp),
             manifest_error=manifest_error,
         )
+        out["reason"] = "manifest_empty"
+        return out
 
     manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
+    category_source = "unknown"
     if not opts.use_picker and not manual_categories and not (continue_from and continue_from.get("stage") == "confirm_refine"):
         return {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales.", "trace_id": trace_id}
 
@@ -838,21 +850,41 @@ def run_query(
         suggested = [c for c in ((continue_from.get("selected_categories") or (conversation_state or {}).get("suggested_categories") or [])) if c in valid_set]
         user_reply = str(continue_from.get("user_reply") or "")
         domain_hint = str((conversation_state or {}).get("domain_hint") or detect_domain_hint(q_curr) or "")
+        category_source = "state"
     else:
         q_curr = question
         domain_hint = detect_domain_hint(q_curr)
         if opts.use_picker:
+            if debug:
+                _dbg("MANIFEST_STATE", {
+                    "where": "before_pick",
+                    "categories_count": len(valid_set),
+                    "categories_sample": list(valid_set)[:5],
+                })
             picked_curr = _stage("pick", lambda: pick_stage.run(q_curr, manifest.categories, debug=debug))
+            if debug:
+                _dbg("PICK_OUTPUT_FULL", {"raw_pick_output": picked_curr})
             suggested = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
+            category_source = "pick"
+            if debug:
+                _dbg("PICK_AFTER_FILTER", {"picked_curr": picked_curr, "selected_categories": suggested})
         else:
             picked_curr = {"selected": list(manual_categories)}
             suggested = [c for c in manual_categories if c in valid_set][: opts.max_categories]
+            category_source = "manual"
         user_reply = ""
 
     if not suggested:
         return {"error": "missing_categories", "trace_id": trace_id}
 
     if opts.use_confirmer:
+        if debug:
+            _dbg("CONFIRM_INVOKE", {"invoked": True})
+            _dbg("MANIFEST_STATE", {
+                "where": "before_confirm",
+                "categories_count": len(valid_set),
+                "categories_sample": list(valid_set)[:5],
+            })
         confirm_out = _stage(
             "confirm",
             lambda: confirm_stage.run(
@@ -866,6 +898,8 @@ def run_query(
             ),
         )
     else:
+        if debug:
+            _dbg("CONFIRM_INVOKE", {"invoked": False, "reason": "disabled"})
         confirm_out = {
             "decision": "CONFIRMED",
             "reason": "confirm_disabled",
@@ -911,6 +945,7 @@ def run_query(
         rewritten = str(confirm_out.get("rewritten_prompt") or q_curr).strip() or q_curr
         _dbg("LOOP_REPICK_TRIGGERED", {"trace_id": trace_id})
         repicked = _stage("pick", lambda: pick_stage.run(rewritten, manifest.categories, debug=debug))
+        category_source = "confirm"
         state = {
             "last_question": rewritten,
             "manifest_path": mp,
@@ -933,6 +968,10 @@ def run_query(
         }
 
     selected_categories = [c for c in (confirm_out.get("suggested_categories") or suggested) if c in valid_set][: opts.max_categories]
+    if category_source == "unknown":
+        category_source = "fallback"
+    if debug:
+        _dbg("CATEGORY_SOURCE", {"source": category_source})
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
@@ -974,6 +1013,12 @@ def run_query(
 
     retrieval_by_variant: Dict[str, Dict[str, Any]] = {}
     if opts.use_retrieve:
+        if debug:
+            _dbg("MANIFEST_STATE", {
+                "where": "before_retrieve",
+                "categories_count": len(valid_set),
+                "categories_sample": list(valid_set)[:5],
+            })
         def _run_variant_retrieve(candidate: Dict[str, Any]) -> Dict[str, Any]:
             return _retrieve_candidate_package(
                 candidate=candidate,
@@ -1089,6 +1134,15 @@ def run_query(
         _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "write", "elapsed_ms": 0.0, "next_stage": "done", "reason": "disabled"})
         status = "ok"
         answer = "Etapa write deshabilitada por configuración de pipeline."
+
+    if debug:
+        _dbg("FINAL_CATEGORY_DECISION", {
+            "manifest_count": len(valid_set),
+            "picked_curr": picked_curr,
+            "selected_categories": selected_categories,
+            "confirm_action": str((confirm_out.get("raw") or {}).get("action") or ""),
+            "category_source": category_source,
+        })
 
     return {
         "status": status,

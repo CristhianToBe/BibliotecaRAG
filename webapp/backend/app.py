@@ -323,6 +323,16 @@ async def chat(request: Request):
 
         continue_confirm = bool(req.continue_from and req.continue_from.stage == "confirm_refine")
         debug_manifest_keys: list[str] = []
+        if req.debug:
+            try:
+                manifest_dbg = load_manifest(_resolve_manifest_path(req.manifest_path))
+                debug_manifest_keys = list(manifest_dbg.categories.keys()) if isinstance(manifest_dbg.categories, dict) else []
+            except Exception as exc:
+                print("[DEBUG] /api/chat manifest_debug_load_error", {
+                    "trace_id": trace_id,
+                    "manifest_path": str(_resolve_manifest_path(req.manifest_path)),
+                    "error": str(exc),
+                })
 
         pipeline_payload = req.pipeline.model_dump(exclude_none=True) if req.pipeline else PipelineRequest().model_dump(exclude_none=True)
         pipeline_payload["use_picker"] = bool(effective_use_picker)

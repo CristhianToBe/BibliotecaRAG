@@ -9,6 +9,7 @@ from .llm import MODEL_CONFIRM, SYSTEM_CONFIRM, call_text, clip, eprint
 from .pick import pick_categories
 from .retrieve import retrieve_via_tool
 from .confirm_rules import enforce_confirm_schema, fallback_clarification, strip_category_mentions, route_confirm_action
+from .telemetry import get_telemetry
 
 
 def run(
@@ -27,6 +28,10 @@ def run(
     repick loop must continue.
     """
     valid = list(manifest.categories.keys())
+    telemetry = get_telemetry()
+    trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
+    if debug:
+        eprint("[DEBUG] CONFIRM_ENTER", {"trace_id": trace_id})
     valid_set = set(valid)
     suggested = [
         c for c in (suggested_categories or picked.get("selected") or []) if c in valid_set
@@ -41,6 +46,12 @@ def run(
         user_reply=(user_reply or "").strip(),
         debug=debug,
     )
+    if debug:
+        eprint("[DEBUG] CONFIRM_INPUT", {
+            "trace_id": trace_id,
+            "suggested_categories": suggested,
+            "user_reply": (user_reply or ""),
+        })
     action = str(decision.get("action") or "REFINE").strip().upper()
 
     pipeline_decision = "REPICK"
@@ -56,7 +67,7 @@ def run(
         if selector_instruction:
             rewritten_prompt = f"{question}\n\nInstrucción adicional para seleccionar categorías: {selector_instruction}".strip()
 
-    return {
+    out = {
         "decision": pipeline_decision,
         "reason": str(decision.get("message_to_user") or decision.get("selector_instruction") or "").strip(),
         "rewritten_prompt": rewritten_prompt,
@@ -64,6 +75,14 @@ def run(
         "message_to_user": str(decision.get("message_to_user") or "").strip(),
         "raw": decision,
     }
+    if debug:
+        eprint("[DEBUG] CONFIRM_OUTPUT", {
+            "trace_id": trace_id,
+            "action": str((decision or {}).get("action") or ""),
+            "categories_final": None,
+            "pipeline_decision": pipeline_decision,
+        })
+    return out
 
 
 def _safe_json_load(s: str) -> Dict[str, Any]:
