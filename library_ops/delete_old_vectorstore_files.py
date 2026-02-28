@@ -85,14 +85,21 @@ def run(
     print("Nota: la eliminación es eventualmente consistente; puede tardar un poco en reflejarse en búsquedas.")
     return 0
 
-def build_parser(sp: argparse._SubParsersAction) -> None:
-    p = sp.add_parser("delete-old-vs-files", help="Desvincula archivos de vector stores antiguos usando un manifest viejo")
+
+
+def _configure_parser(p: argparse.ArgumentParser) -> None:
     p.add_argument("--manifest", required=True, help="Ruta al library.json viejo")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--debug", action="store_true")
     p.add_argument("--sleep-ms", type=int, default=0)
     p.add_argument("--max-deletes", type=int, default=0)
     p.add_argument("--skip-vs", default="")
+
+
+def build_parser(sp: argparse._SubParsersAction) -> None:
+    p = sp.add_parser("delete-old-vs-files", help="Desvincula archivos de vector stores antiguos usando un manifest viejo")
+    _configure_parser(p)
+
     def _cmd(args: argparse.Namespace) -> int:
         return run(
             manifest=Path(args.manifest).expanduser(),
@@ -102,4 +109,22 @@ def build_parser(sp: argparse._SubParsersAction) -> None:
             max_deletes=args.max_deletes,
             skip_vs=args.skip_vs,
         )
+
+    p.set_defaults(func=_cmd)
+
+
+def build_parser_alias(sp: argparse._SubParsersAction) -> None:
+    p = sp.add_parser("delete-old-vectors", help="Alias explícito para eliminar archivos de vector stores antiguos")
+    _configure_parser(p)
+
+    def _cmd(args: argparse.Namespace) -> int:
+        return run(
+            manifest=Path(args.manifest).expanduser(),
+            dry_run=args.dry_run,
+            debug=args.debug,
+            sleep_ms=args.sleep_ms,
+            max_deletes=args.max_deletes,
+            skip_vs=args.skip_vs,
+        )
+
     p.set_defaults(func=_cmd)

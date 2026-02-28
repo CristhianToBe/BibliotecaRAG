@@ -16,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     fill_vectorstores.build_parser_alias(sp)
     fill_keywords.build_parser(sp)
     delete_old_vectorstore_files.build_parser(sp)
+    delete_old_vectorstore_files.build_parser_alias(sp)
     orchestrate.build_parser(sp)
     relink_openai_files.build_parser(sp)
     verify_vectorstore.build_parser(sp)

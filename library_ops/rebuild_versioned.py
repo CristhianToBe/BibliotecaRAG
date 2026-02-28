@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from worklib.config import default_config
 from worklib.store import Category, Doc, Manifest, load_manifest, save_manifest
 from worklib.prompt_loader import load_prompt
+from worklib.versioning import get_biblioteca_root, next_version_number, resolve_manifest_path
 
 from .openai_utils import get_client, llm_json, get_vs_file_text
 from .bootstrap_manifest import run as bootstrap_manifest_run
@@ -46,14 +47,7 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 def next_version_folder(parent: Path) -> Tuple[int, Path]:
-    max_n = 0
-    if parent.exists():
-        for p in parent.iterdir():
-            if p.is_dir():
-                m = re.fullmatch(r"v(\d+)", p.name)
-                if m:
-                    max_n = max(max_n, int(m.group(1)))
-    n = max_n + 1
+    n = next_version_number(parent)
     return n, parent / f"v{n}"
 
 def safe_copy(src: Path, dst: Path) -> Path:
@@ -230,7 +224,7 @@ def run(
     load_dotenv()
     cfg = default_config()
 
-    manifest_path = manifest_override if manifest_override else cfg.manifest_path
+    manifest_path = resolve_manifest_path(manifest_override if manifest_override else cfg.manifest_path)
     if not manifest_path.exists():
         print(f"⚠️ No existe manifest: {manifest_path}")
         print("↪ Intentando reconstruirlo automáticamente desde los documentos existentes...")
@@ -248,10 +242,11 @@ def run(
 
     docs = docs_all[: max_docs] if max_docs and max_docs > 0 else docs_all
 
-    vnum, vroot = next_version_folder(cfg.library_dir)
+    biblioteca_root = get_biblioteca_root()
+    vnum, vroot = next_version_folder(biblioteca_root)
     version_label = f"v{vnum}"
     v_state = vroot / "_state"
-    v_lib = vroot / "biblioteca"
+    v_lib = vroot
     ensure_dir(v_state); ensure_dir(v_lib)
 
     # Step 0: prefixes
@@ -475,7 +470,7 @@ def run(
     return 0
 
 def build_parser(sp: argparse._SubParsersAction) -> None:
-    p = sp.add_parser("rebuild-versioned", help="Rebuild library into Biblioteca/biblioteca/vN with AUTOR/AÑO prefix + GPT taxonomy")
+    p = sp.add_parser("rebuild-versioned", help="Rebuild library into Biblioteca/vN with AUTOR/AÑO prefix + GPT taxonomy")
     p.add_argument("--manifest", default=None, help="Ruta a library.json (override)")
     p.add_argument("--apply", action="store_true", help="Aplica cambios. Si no, solo plan.")
     p.add_argument("--mode", choices=["copy","move"], default="copy")

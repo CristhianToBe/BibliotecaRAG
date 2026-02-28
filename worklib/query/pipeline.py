@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
@@ -151,8 +150,9 @@ def _run_with_timeout(timeout_s: float, fn: Callable[[], Any], fallback: Any) ->
 
 
 def _default_manifest_path() -> str:
-    _cfg = default_config()
-    return os.getenv("RAG_MANIFEST_PATH") or os.getenv("WORKLIB_MANIFEST_PATH") or str(_cfg.manifest_path)
+    from worklib.versioning import resolve_manifest_path
+
+    return str(resolve_manifest_path(None))
 
 
 def _count_docs_by_category(manifest: Manifest) -> Dict[str, int]:

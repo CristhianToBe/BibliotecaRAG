@@ -53,8 +53,76 @@ Subcomandos disponibles:
 - `rebuild-versioned`
 - `fill-vectorstores`
 - `fill-keywords`
-- `delete-old-vs-files`
+- `delete-old-vs-files` / `delete-old-vectors`
 - `orchestrate`
+
+## Versioning & Orchestration
+
+### Layout de versiones
+
+El layout canónico ahora es:
+
+- `Biblioteca/vN/` (una carpeta por versión)
+- `Biblioteca/vN/_state/library.json` (manifest de esa versión)
+- `Biblioteca/archives/` (zips de versiones archivadas)
+
+> Cambio relevante: el root de versión se movió de `Biblioteca/biblioteca/vN` a `Biblioteca/vN`.
+
+### Resolución de la última versión
+
+Toda resolución automática de manifest usa `worklib/versioning.py`:
+
+- `get_biblioteca_root()`
+- `list_versions()`
+- `latest_version()`
+- `latest_manifest_path()`
+- `resolve_manifest_path(manifest_arg)`
+
+Si no se pasa `--manifest`, se usa `resolve_manifest_path(None)` y por defecto toma `Biblioteca/v{latest}/_state/library.json`.
+
+### Política de archivo de versiones
+
+Al finalizar `orchestrate` con éxito (rebuild + fill + smoke test):
+
+1. Se identifica la versión inmediatamente anterior.
+2. Se crea zip en `Biblioteca/archives/vN_YYYYMMDD_HHMMSS.zip`.
+3. Por defecto se elimina la carpeta anterior para ahorrar disco.
+
+Flags:
+
+- `--no-archive`: no zippea ni elimina.
+- `--keep-old-folder`: zippea pero conserva la carpeta vieja.
+
+### Orchestrate y borrado de vectores
+
+`orchestrate` ya **no borra** archivos viejos de vector stores automáticamente.
+
+- Para ejecutar ese borrado manualmente en `orchestrate`, agrega `--delete-old-vectors`.
+- También puedes ejecutar explícitamente el subcomando:
+
+```bash
+python run_library_ops.py delete-old-vectors --manifest /ruta/al/manifest_viejo.json
+```
+
+### Smoke test post-orquestación
+
+Por defecto, `orchestrate` ejecuta un smoke test E2E al final con el query:
+
+- `¿qué es el SIAR?`
+
+El smoke test usa el pipeline normal de consulta (pick/confirm/refine/retrieve/write) contra el manifest más reciente. Si falla, `orchestrate` termina con código no-cero.
+
+Flags:
+
+- `--smoke-test` (default ON)
+- `--no-smoke-test`
+- `--smoke-test-query "..."`
+
+Ejemplo:
+
+```bash
+python run_library_ops.py orchestrate --apply
+```
 
 ## Dónde vive el motor RAG y CLI actual
 
@@ -67,19 +135,13 @@ Subcomandos disponibles:
 
 ## Configuración de manifest y directorios (env vars)
 
-La configuración base se resuelve en `worklib/config.py` con este orden:
+La configuración base se resuelve con `worklib/versioning.py` y `worklib/config.py`.
 
-- `WORKLIB_ROOT` (opcional)
-- fallback a `./Biblioteca` junto a `worklib/config.py` (si existe)
-- fallback final: `Path.cwd()`
+- `WORKLIB_BIBLIOTECA_ROOT`: root explícito de `Biblioteca`.
+- `WORKLIB_ROOT`: fallback alterno.
+- `WORKLIB_MANIFEST_PATH` o `RAG_MANIFEST_PATH`: override directo de manifest.
 
-Desde ese root:
-
-- `WORKLIB_LIBRARY_DIR` (default: `<root>/biblioteca`)
-- `WORKLIB_STATE_DIR` (default: `<root>/_state`)
-- `WORKLIB_MANIFEST_PATH` (default: `<state_dir>/library.json`)
-
-Para query, también se respeta `RAG_MANIFEST_PATH` como override de manifest.
+Sin overrides, la ruta efectiva de manifest se resuelve a la última versión disponible (`Biblioteca/vN/_state/library.json`).
 
 ## Web app mínima (FastAPI + Vue 3)
 
