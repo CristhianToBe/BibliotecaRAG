@@ -8,7 +8,7 @@ from worklib.store import Manifest
 from .llm import MODEL_CONFIRM, SYSTEM_CONFIRM, call_text, clip, eprint
 from .pick import pick_categories
 from .retrieve import retrieve_via_tool
-from .confirm_rules import enforce_confirm_schema, fallback_clarification, strip_category_mentions
+from .confirm_rules import enforce_confirm_schema, fallback_clarification, strip_category_mentions, route_confirm_action
 
 
 def run(

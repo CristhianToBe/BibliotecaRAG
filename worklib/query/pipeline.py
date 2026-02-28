@@ -16,6 +16,8 @@ from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
 from .arbiter_utils import choose_variant_name
+from .intent_hints import detect_domain_hint, apply_domain_hint_constraints
+from .pipeline_guards import manifest_not_loaded_response
 from . import confirm as confirm_stage
 from .llm import eprint
 from .paths import resolve_local_path
@@ -597,6 +599,15 @@ def run_after_confirm(
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
+    hinted = apply_domain_hint_constraints(
+        domain_hint=domain_hint,
+        must_terms=must_terms,
+        avoid_terms=avoid_terms,
+        query_text=q_curr,
+    )
+    must_terms = list(hinted.get("must_terms") or [])
+    avoid_terms = list(hinted.get("avoid_terms") or [])
+    q_curr = str(hinted.get("query_text") or q_curr)
 
     refiners = _timed_stage(
         "refine",
@@ -770,9 +781,14 @@ def run_query(
     """Central orchestrator: pick -> confirm loop -> refine -> retrieve(by variant) -> arbiter -> write."""
     opts = _coerce_pipeline_options(pipeline)
     mp = manifest_path or _default_manifest_path()
-    manifest = load_manifest(Path(mp))
-    valid_set = set(manifest.categories.keys())
     telemetry = get_telemetry()
+    try:
+        manifest = load_manifest(Path(mp))
+        manifest_error = ""
+    except Exception as exc:
+        manifest = Manifest(categories={}, docs={})
+        manifest_error = f"{type(exc).__name__}: {exc}"
+    valid_set = set(manifest.categories.keys()) if isinstance(getattr(manifest, "categories", None), dict) else set()
     trace_id = getattr(telemetry, "trace_id", "no-trace")
 
     def _dbg(label: str, payload: Dict[str, Any]) -> None:
@@ -799,6 +815,19 @@ def run_query(
             telemetry.mark_stage(stage_name, time.perf_counter() - started)
         return out
 
+    if (not valid_set):
+        if debug:
+            _dbg("MANIFEST_GUARD", {
+                "manifest_path": str(mp),
+                "valid_categories_len": 0,
+                "manifest_error": manifest_error,
+            })
+        return manifest_not_loaded_response(
+            trace_id=trace_id,
+            manifest_path=str(mp),
+            manifest_error=manifest_error,
+        )
+
     manual_categories = [str(c).strip() for c in (manual_categories or []) if str(c).strip()]
     if not opts.use_picker and not manual_categories and not (continue_from and continue_from.get("stage") == "confirm_refine"):
         return {"error": "missing_minimum", "details": "Debes activar Picker o indicar categorías manuales.", "trace_id": trace_id}
@@ -808,8 +837,10 @@ def run_query(
         q_curr = str((conversation_state or {}).get("last_question") or question or "")
         suggested = [c for c in ((continue_from.get("selected_categories") or (conversation_state or {}).get("suggested_categories") or [])) if c in valid_set]
         user_reply = str(continue_from.get("user_reply") or "")
+        domain_hint = str((conversation_state or {}).get("domain_hint") or detect_domain_hint(q_curr) or "")
     else:
         q_curr = question
+        domain_hint = detect_domain_hint(q_curr)
         if opts.use_picker:
             picked_curr = _stage("pick", lambda: pick_stage.run(q_curr, manifest.categories, debug=debug))
             suggested = [c for c in (picked_curr.get("selected") or []) if c in valid_set][: opts.max_categories]
@@ -853,6 +884,29 @@ def run_query(
         "rewritten_prompt": confirm_out.get("rewritten_prompt") or "",
     })
 
+    if confirm_out.get("decision") == "AWAITING_USER_REPLY":
+        state = {
+            "last_question": q_curr,
+            "manifest_path": mp,
+            "picked": picked_curr,
+            "suggested_categories": suggested,
+            "selected_categories": suggested,
+            "domain_hint": domain_hint,
+        }
+        return {
+            "status": "needs_confirmation",
+            "trace_id": trace_id,
+            "question": q_curr,
+            "picked_curr": picked_curr,
+            "confirm": confirm_out,
+        "domain_hint": domain_hint,
+            "suggested_categories": suggested,
+            "reason": str(confirm_out.get("reason") or ""),
+            "state": state,
+            "awaiting_user_reply": True,
+            "message": confirm_out.get("message_to_user") or "Confirma o ajusta el enfoque antes de continuar.",
+        }
+
     if confirm_out.get("decision") in {"REPICK", "PARTIAL"}:
         rewritten = str(confirm_out.get("rewritten_prompt") or q_curr).strip() or q_curr
         _dbg("LOOP_REPICK_TRIGGERED", {"trace_id": trace_id})
@@ -863,6 +917,7 @@ def run_query(
             "picked": repicked,
             "suggested_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
             "selected_categories": [c for c in (repicked.get("selected") or []) if c in valid_set][: opts.max_categories],
+            "domain_hint": domain_hint,
         }
         return {
             "status": "needs_confirmation",
@@ -870,6 +925,7 @@ def run_query(
             "question": rewritten,
             "picked_curr": repicked,
             "confirm": confirm_out,
+        "domain_hint": domain_hint,
             "suggested_categories": state["suggested_categories"],
             "reason": str(confirm_out.get("reason") or ""),
             "state": state,
@@ -880,6 +936,15 @@ def run_query(
 
     must_terms = list(picked_curr.get("must_include_terms", []) or [])
     avoid_terms = list(picked_curr.get("avoid_terms", []) or [])
+    hinted = apply_domain_hint_constraints(
+        domain_hint=domain_hint,
+        must_terms=must_terms,
+        avoid_terms=avoid_terms,
+        query_text=q_curr,
+    )
+    must_terms = list(hinted.get("must_terms") or [])
+    avoid_terms = list(hinted.get("avoid_terms") or [])
+    q_curr = str(hinted.get("query_text") or q_curr)
     enabled_variants: List[str] = []
     if opts.use_refiner:
         if opts.refine_a1:
@@ -1032,6 +1097,7 @@ def run_query(
         "references": refs,
         "selected_categories": selected_categories,
         "confirm": confirm_out,
+        "domain_hint": domain_hint,
         "chosen_candidate": chosen_candidate,
         "chosen_candidate_hits_count": len(chosen_hits),
         "arbiter": arbiter_meta,

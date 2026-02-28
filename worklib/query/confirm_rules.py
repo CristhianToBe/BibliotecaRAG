@@ -94,6 +94,18 @@ def fallback_clarification() -> Dict[str, object]:
     }
 
 
+def route_confirm_action(*, action: str, user_reply: str) -> str:
+    action_u = str(action or "REFINE").strip().upper()
+    has_reply = bool((user_reply or "").strip())
+    if action_u == "PASS":
+        return "CONFIRMED"
+    if action_u == "REPHRASE":
+        return "PARTIAL"
+    if has_reply:
+        return "REPICK"
+    return "AWAITING_USER_REPLY"
+
+
 def self_check_cases() -> List[Dict[str, object]]:
     cases = [
         "",
