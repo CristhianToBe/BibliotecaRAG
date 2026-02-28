@@ -15,7 +15,7 @@ from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
-from .arbiter_utils import derive_winner, normalize_indexes
+from .arbiter_utils import choose_variant_name
 from . import confirm as confirm_stage
 from .llm import eprint
 from .paths import resolve_local_path
@@ -936,99 +936,80 @@ def run_query(
         _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "retrieve"})
         _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "retrieve", "elapsed_ms": 0.0, "next_stage": "write", "reason": "disabled"})
 
-    chosen_candidate: Dict[str, Any] = refiners[0]
-    chosen_hits: List[Dict[str, Any]] = retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits", []) if retrieval_by_variant else []
-    arbiter_meta: Dict[str, Any] = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "not_run", "considered": [str(x.get("name") or "A1") for x in refiners]}
-
-    if opts.use_retrieve and opts.use_arbiter and len(retrieval_by_variant) > 1:
-        candidates_for_arbiter = []
-        for candidate in refiners:
-            name = str(candidate.get("name") or "A1")
-            pkg = retrieval_by_variant.get(name, {})
-            candidates_for_arbiter.append({
-                "candidate": name,
-                "query_used": str(candidate.get("query") or q_curr),
-                "constraints": dict(candidate.get("constraints") or {}),
-                "hits": list(pkg.get("hits") or []),
-                "hits_count": int(pkg.get("hits_count") or 0),
-            })
-
-        arbiter_out = _stage(
-            "arbiter",
-            lambda: arbitrate(
-                q_curr,
-                candidates_for_arbiter,
-                [],
-                categories=selected_categories,
-                selector_instruction=str((confirm_out.get("raw") or {}).get("selector_instruction") or ""),
-                debug=debug,
-            ),
-        )
-        considered = list(arbiter_out.get("considered") or [str(x.get("name") or "A1") for x in refiners])
-        selected_indexes = normalize_indexes(arbiter_out.get("selected_indexes"))
-        also_indexes = normalize_indexes(arbiter_out.get("also_indexes"))
-        winner_raw = str(arbiter_out.get("winner") or arbiter_out.get("chosen_variant_name") or "")
-        winner = derive_winner(considered=considered, winner=winner_raw, selected_indexes=selected_indexes)
-
-        if winner not in considered:
-            _dbg("ARBITER_WINNER_DERIVED", {
-                "trace_id": trace_id,
-                "reason": "winner_not_in_considered",
-                "winner_raw": winner_raw,
-                "considered": considered,
-                "selected_indexes": selected_indexes,
-            })
-            winner = derive_winner(considered=considered, winner="", selected_indexes=selected_indexes)
-
-        if selected_indexes and (0 <= selected_indexes[0] < len(considered)):
-            expected_from_idx = considered[selected_indexes[0]]
-            if winner != expected_from_idx:
-                _dbg("ARBITER_WINNER_DERIVED", {
-                    "trace_id": trace_id,
-                    "reason": "winner_index_mismatch_autofix",
-                    "winner_before": winner,
-                    "winner_after": expected_from_idx,
-                    "selected_indexes": selected_indexes,
-                    "considered": considered,
-                })
-                winner = expected_from_idx
-
-        candidates_by_name = {str(c.get("name") or "A1"): c for c in refiners}
-        if winner not in candidates_by_name:
-            hits_by_variant = {k: int((v or {}).get("hits_count") or 0) for k, v in retrieval_by_variant.items()}
-            _dbg("ARBITER_FALLBACK", {
-                "trace_id": trace_id,
-                "reason": "winner_missing_in_candidates",
-                "considered": considered,
-                "hits_by_variant": hits_by_variant,
-            })
-            winner = derive_winner(considered=list(candidates_by_name.keys()), winner="", selected_indexes=[])
-
-        chosen_candidate = candidates_by_name[winner]
-        chosen_hits = list((retrieval_by_variant.get(winner) or {}).get("hits") or [])
-        arbiter_meta = {
-            "winner": winner,
-            "reason": str(arbiter_out.get("why") or arbiter_out.get("rationale") or "selected_by_arbiter"),
-            "considered": considered,
-            "signal_summary": dict(arbiter_out.get("signal_summary") or {}),
-            "selected_indexes": selected_indexes,
-            "also_indexes": also_indexes,
+    considered_variants = [str(x.get("name") or "A1") for x in refiners]
+    signal_summary: Dict[str, Dict[str, Any]] = {}
+    for candidate in refiners:
+        name = str(candidate.get("name") or "A1")
+        pkg = retrieval_by_variant.get(name, {})
+        hits = list(pkg.get("hits") or [])
+        constraints = dict(candidate.get("constraints") or {})
+        must_terms = [str(x).strip().lower() for x in (constraints.get("must_include_terms") or []) if str(x).strip()]
+        corpus = "\n".join(str(h.get("text") or "").lower() for h in hits)
+        matched = sum(1 for term in must_terms if term and term in corpus)
+        coverage = (matched / max(1, len(must_terms))) if must_terms else 1.0
+        unique_docs = len({str(h.get("doc_id") or h.get("file_id") or h.get("filename") or "") for h in hits if (h.get("doc_id") or h.get("file_id") or h.get("filename"))})
+        signal_summary[name] = {
+            "hits_count": int(pkg.get("hits_count") or 0),
+            "unique_docs": int(unique_docs),
+            "must_terms_coverage": round(float(coverage), 3),
         }
+
+    chosen_variant_name = choose_variant_name(signal_summary, considered_variants)
+    chosen_candidate = next((c for c in refiners if str(c.get("name") or "A1") == chosen_variant_name), refiners[0])
+    chosen_hits: List[Dict[str, Any]] = list((retrieval_by_variant.get(chosen_variant_name) or {}).get("hits") or [])
+
+    _dbg("VARIANT_CHOSEN", {
+        "trace_id": trace_id,
+        "name": chosen_variant_name,
+        "reason": "max(must_terms_coverage,unique_docs,hits_count)",
+        "signal_summary": signal_summary,
+    })
+
+    arbiter_meta: Dict[str, Any] = {
+        "winner": chosen_variant_name,
+        "reason": "variant_deterministic_signals",
+        "considered": considered_variants,
+        "signal_summary": signal_summary,
+        "selected_indexes": [],
+        "also_indexes": [],
+    }
+
+    if opts.use_retrieve and opts.use_arbiter:
+        if chosen_hits:
+            arbiter_out = _stage(
+                "arbiter",
+                lambda: arbitrate(
+                    q_curr,
+                    [],
+                    chosen_hits,
+                    categories=selected_categories,
+                    selector_instruction=str((confirm_out.get("raw") or {}).get("selector_instruction") or ""),
+                    debug=debug,
+                ),
+            )
+            selected_indexes = [i for i in (arbiter_out.get("selected_indexes") or []) if isinstance(i, int) and 0 <= i < len(chosen_hits)]
+            also_indexes = [i for i in (arbiter_out.get("also_indexes") or []) if isinstance(i, int) and 0 <= i < len(chosen_hits) and i not in selected_indexes]
+            if not selected_indexes:
+                selected_indexes = list(range(min(3, len(chosen_hits))))
+            chosen_hits = [chosen_hits[i] for i in selected_indexes + [i for i in also_indexes if i not in selected_indexes]]
+            arbiter_meta = {
+                "winner": chosen_variant_name,
+                "reason": str(arbiter_out.get("why") or "selected_by_evidence_arbiter"),
+                "considered": considered_variants,
+                "signal_summary": signal_summary,
+                "selected_indexes": selected_indexes,
+                "also_indexes": also_indexes,
+            }
+        else:
+            _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "no_evidence_for_chosen_variant", "winner": chosen_variant_name})
         _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
     elif not opts.use_retrieve:
         if opts.use_arbiter:
             _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "retrieve_disabled"})
-        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "retrieve_disabled", "considered": [str(x.get("name") or "A1") for x in refiners]}
-    elif not opts.use_arbiter:
-        default_name = "A1" if any(str(x.get("name") or "").upper() == "A1" for x in refiners) else str(refiners[0].get("name") or "A1")
-        chosen_candidate = next((c for c in refiners if str(c.get("name") or "").upper() == default_name), refiners[0])
-        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
-        _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "disabled", "default": default_name})
-        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "disabled", "considered": [str(x.get("name") or "A1") for x in refiners]}
+        arbiter_meta.update({"reason": "retrieve_disabled"})
     else:
-        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
-        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "single_candidate", "considered": [str(x.get("name") or "A1") for x in refiners]}
-        _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
+        _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "disabled", "winner": chosen_variant_name})
+        arbiter_meta.update({"reason": "disabled"})
 
     q_final = str(chosen_candidate.get("query") or q_curr)
     refs = _collect_references(manifest, chosen_hits)
