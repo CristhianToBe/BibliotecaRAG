@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 from worklib.prompt_loader import load_prompt
 from .llm import call_text, eprint, MODEL_ARBITRATE
+from .arbiter_utils import derive_winner, normalize_indexes
 
 SYSTEM_ARBITER = load_prompt("query_arbiter_system")
 
@@ -120,14 +121,23 @@ def arbitrate(
         except Exception:
             parsed = {}
 
-    winner = str(parsed.get("winner") or parsed.get("chosen_variant_name") or deterministic_winner).strip().upper()
-    if winner not in considered:
-        winner = deterministic_winner
+    selected_indexes = normalize_indexes(parsed.get("selected_indexes"))
+    also_indexes = normalize_indexes(parsed.get("also_indexes"))
+    if not selected_indexes:
+        selected_indexes = [0] if considered else []
 
-    winner_pkg = next((x for x in candidate_packages if str(x.get("candidate") or "").upper() == winner), candidate_packages[0])
+    parsed_winner = str(parsed.get("winner") or parsed.get("chosen_variant_name") or "").strip()
+    winner = derive_winner(considered=considered, winner=parsed_winner, selected_indexes=selected_indexes)
+    if not parsed_winner and selected_indexes:
+        if debug:
+            eprint("[DEBUG] ARBITER_WINNER_DERIVED", {
+                "considered": considered,
+                "selected_indexes": selected_indexes,
+                "winner": winner,
+            })
+
+    winner_pkg = next((x for x in candidate_packages if str(x.get("candidate") or "") == winner), candidate_packages[0])
     winner_hits = list(winner_pkg.get("hits") or [])
-    selected_indexes = list(parsed.get("selected_indexes") or list(range(min(3, len(winner_hits)))))
-    also_indexes = list(parsed.get("also_indexes") or [])
 
     if all_zero_hits:
         why = "all_zero_hits_fallback"

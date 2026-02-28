@@ -15,6 +15,7 @@ from worklib.config import default_config
 from worklib.store import Doc, Manifest, load_manifest
 
 from .arbitrate import arbitrate
+from .arbiter_utils import derive_winner, normalize_indexes
 from . import confirm as confirm_stage
 from .llm import eprint
 from .paths import resolve_local_path
@@ -963,16 +964,55 @@ def run_query(
                 debug=debug,
             ),
         )
-        winner = str(arbiter_out.get("winner") or arbiter_out.get("chosen_variant_name") or "A1").upper()
-        chosen_candidate = next((c for c in refiners if str(c.get("name") or "").upper() == winner), refiners[0])
-        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
+        considered = list(arbiter_out.get("considered") or [str(x.get("name") or "A1") for x in refiners])
+        selected_indexes = normalize_indexes(arbiter_out.get("selected_indexes"))
+        also_indexes = normalize_indexes(arbiter_out.get("also_indexes"))
+        winner_raw = str(arbiter_out.get("winner") or arbiter_out.get("chosen_variant_name") or "")
+        winner = derive_winner(considered=considered, winner=winner_raw, selected_indexes=selected_indexes)
+
+        if winner not in considered:
+            _dbg("ARBITER_WINNER_DERIVED", {
+                "trace_id": trace_id,
+                "reason": "winner_not_in_considered",
+                "winner_raw": winner_raw,
+                "considered": considered,
+                "selected_indexes": selected_indexes,
+            })
+            winner = derive_winner(considered=considered, winner="", selected_indexes=selected_indexes)
+
+        if selected_indexes and (0 <= selected_indexes[0] < len(considered)):
+            expected_from_idx = considered[selected_indexes[0]]
+            if winner != expected_from_idx:
+                _dbg("ARBITER_WINNER_DERIVED", {
+                    "trace_id": trace_id,
+                    "reason": "winner_index_mismatch_autofix",
+                    "winner_before": winner,
+                    "winner_after": expected_from_idx,
+                    "selected_indexes": selected_indexes,
+                    "considered": considered,
+                })
+                winner = expected_from_idx
+
+        candidates_by_name = {str(c.get("name") or "A1"): c for c in refiners}
+        if winner not in candidates_by_name:
+            hits_by_variant = {k: int((v or {}).get("hits_count") or 0) for k, v in retrieval_by_variant.items()}
+            _dbg("ARBITER_FALLBACK", {
+                "trace_id": trace_id,
+                "reason": "winner_missing_in_candidates",
+                "considered": considered,
+                "hits_by_variant": hits_by_variant,
+            })
+            winner = derive_winner(considered=list(candidates_by_name.keys()), winner="", selected_indexes=[])
+
+        chosen_candidate = candidates_by_name[winner]
+        chosen_hits = list((retrieval_by_variant.get(winner) or {}).get("hits") or [])
         arbiter_meta = {
-            "winner": str(chosen_candidate.get("name") or "A1"),
+            "winner": winner,
             "reason": str(arbiter_out.get("why") or arbiter_out.get("rationale") or "selected_by_arbiter"),
-            "considered": list(arbiter_out.get("considered") or [str(x.get("name") or "A1") for x in refiners]),
+            "considered": considered,
             "signal_summary": dict(arbiter_out.get("signal_summary") or {}),
-            "selected_indexes": list(arbiter_out.get("selected_indexes") or []),
-            "also_indexes": list(arbiter_out.get("also_indexes") or []),
+            "selected_indexes": selected_indexes,
+            "also_indexes": also_indexes,
         }
         _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
     elif not opts.use_retrieve:
@@ -994,6 +1034,13 @@ def run_query(
     refs = _collect_references(manifest, chosen_hits)
 
     if opts.use_write:
+        _dbg("WRITE_INPUT", {
+            "trace_id": trace_id,
+            "winner": arbiter_meta.get("winner"),
+            "chosen_candidate_name": str(chosen_candidate.get("name") or ""),
+            "chosen_hits_count": len(chosen_hits),
+            "chosen_query_used": q_final,
+        })
         answer = _stage("write", lambda: write_stage.run(q_final, chosen_hits, debug=debug))
         status = "ok"
     else:
