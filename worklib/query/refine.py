@@ -88,9 +88,24 @@ def refine_all(
         out: List[Dict[str, Any]] = []
 
         def _run_variant(variant_name: str) -> Dict[str, Any]:
-            result = refine_one(_VARIANT_PROMPTS[variant_name], base_context, debug=debug_ctx)
-            result["name"] = variant_name
-            return result
+            variant_stage_name = f"{stage_name}/{variant_name}"
+            if debug_ctx:
+                eprint("[DEBUG] REFINE_VARIANT_BEGIN", {
+                    "trace_id": getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace",
+                    "variant": variant_name,
+                    "stage_name": variant_stage_name,
+                })
+            variant_tele = set_telemetry(telemetry)
+            variant_stage = set_current_stage(variant_stage_name)
+            variant_dbg = set_debug_enabled(debug_ctx)
+            try:
+                result = refine_one(_VARIANT_PROMPTS[variant_name], base_context, debug=debug_ctx)
+                result["name"] = variant_name
+                return result
+            finally:
+                reset_debug_enabled(variant_dbg)
+                reset_current_stage(variant_stage)
+                reset_telemetry(variant_tele)
 
         workers = max(1, min(3, int(max_workers), len(variants)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -102,6 +117,12 @@ def refine_all(
                 except Exception as exc:
                     if debug_ctx:
                         eprint("[DEBUG] refine variant failed:", {"name": variant_name, "error": str(exc)})
+
+                if debug_ctx:
+                    eprint("[DEBUG] REFINE_VARIANT_END", {
+                        "trace_id": getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace",
+                        "variant": variant_name,
+                    })
 
         out.sort(key=lambda x: variants.index(str(x.get("name") or "A1")) if str(x.get("name") or "A1") in variants else 999)
         if debug_ctx:

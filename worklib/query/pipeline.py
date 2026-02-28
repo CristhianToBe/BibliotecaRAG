@@ -379,6 +379,72 @@ def _retrieve_quick_fallback(
     return out
 
 
+def _retrieve_candidate_package(
+    *,
+    candidate: Dict[str, Any],
+    manifest: Manifest,
+    manifest_path: str,
+    selected_categories: List[str],
+    top_k: int,
+    max_workers: int,
+    max_context_chars: int,
+    debug: bool,
+) -> Dict[str, Any]:
+    telemetry = get_telemetry()
+    trace_id = getattr(telemetry, "trace_id", "no-trace") if telemetry else "no-trace"
+    candidate_name = str(candidate.get("name") or "A1")
+    q_used = str(candidate.get("query") or "")
+    constraints = dict(candidate.get("constraints") or {})
+    doc_counts = _count_docs_by_category(manifest)
+    category_infos: List[Dict[str, Any]] = []
+    for cname in selected_categories:
+        cat = manifest.categories.get(cname)
+        vs_id = str(getattr(cat, "vector_store_id", "") or "")
+        category_infos.append({"category": cname, "vector_store_id": vs_id, "docs": int(doc_counts.get(cname, 0))})
+
+    if debug:
+        print("[DEBUG] RETRIEVAL_VARIANT_BEGIN", {
+            "trace_id": trace_id,
+            "candidate": candidate_name,
+            "query_used": q_used,
+            "categories": selected_categories,
+        })
+
+    started = time.perf_counter()
+    hits = _retrieve_by_category(
+        q_final=q_used,
+        refiners=[candidate],
+        category_infos=category_infos,
+        max_workers=max_workers,
+        retrieve_timeout_s=_env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 30),
+        top_k=top_k,
+        debug=debug,
+        unbounded=True,
+    )
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+
+    hits = attach_local_paths(manifest, merge_and_dedupe_evidence(hits or []), library_root=Path(manifest_path).parent)
+    hits = _shrink_evidence_payload((hits or []), max_hits=8, max_per_hit_chars=1200)
+    hits = _cap_evidence_chars(hits, max_context_chars)
+
+    if debug:
+        print("[DEBUG] RETRIEVAL_VARIANT_END", {
+            "trace_id": trace_id,
+            "candidate": candidate_name,
+            "hits_count": len(hits),
+            "elapsed_ms": elapsed_ms,
+        })
+
+    return {
+        "candidate": candidate_name,
+        "query_used": q_used,
+        "constraints": constraints,
+        "hits": hits,
+        "hits_count": len(hits),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
 def _pick_with_cache(question: str, categories: Dict[str, Any], pick_ttl_s: float, debug: bool) -> Tuple[Dict[str, Any], bool]:
     key = _normalize_question(question)
     cached = _cache_get(_PICK_CACHE, key)
@@ -702,7 +768,7 @@ def run_query(
     pipeline: Optional[Dict[str, Any]] = None,
     manual_categories: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Central orchestrator: pick -> confirm loop -> refine -> arbiter -> retrieve -> write."""
+    """Central orchestrator: pick -> confirm loop -> refine -> retrieve(by variant) -> arbiter -> write."""
     opts = _coerce_pipeline_options(pipeline)
     mp = manifest_path or _default_manifest_path()
     manifest = load_manifest(Path(mp))
@@ -717,11 +783,12 @@ def run_query(
             print(f"[DEBUG] {label}", base)
 
     def _stage(stage_name: str, fn: Callable[[], Any], *, meta: Optional[Dict[str, Any]] = None) -> Any:
-        _dbg("STAGE_BEGIN", {"stage_name": stage_name})
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": stage_name})
         started = time.perf_counter()
         with stage_ctx(stage_name):
             out = fn()
         end_payload = {
+            "trace_id": trace_id,
             "stage_name": stage_name,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
             "next_stage": "pending",
@@ -778,10 +845,11 @@ def run_query(
             "message_to_user": "",
             "raw": {"action": "PASS"},
         }
-        _dbg("STAGE_BEGIN", {"stage_name": "confirm"})
-        _dbg("STAGE_END", {"stage_name": "confirm", "elapsed_ms": 0.0, "next_stage": "refine", "reason": "disabled"})
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "confirm"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "confirm", "elapsed_ms": 0.0, "next_stage": "refine", "reason": "disabled"})
 
     _dbg("CONFIRM_DECISION", {
+        "trace_id": trace_id,
         "decision": confirm_out.get("decision"),
         "reason": confirm_out.get("reason", ""),
         "rewritten_prompt": confirm_out.get("rewritten_prompt") or "",
@@ -789,7 +857,7 @@ def run_query(
 
     if confirm_out.get("decision") in {"REPICK", "PARTIAL"}:
         rewritten = str(confirm_out.get("rewritten_prompt") or q_curr).strip() or q_curr
-        _dbg("LOOP_REPICK_TRIGGERED", {})
+        _dbg("LOOP_REPICK_TRIGGERED", {"trace_id": trace_id})
         repicked = _stage("pick", lambda: pick_stage.run(rewritten, manifest.categories, debug=debug))
         state = {
             "last_question": rewritten,
@@ -805,6 +873,7 @@ def run_query(
             "picked_curr": repicked,
             "confirm": confirm_out,
             "suggested_categories": state["suggested_categories"],
+            "reason": str(confirm_out.get("reason") or ""),
             "state": state,
             "message": confirm_out.get("message_to_user") or "Confirma o ajusta las categorías sugeridas antes de continuar.",
         }
@@ -837,84 +906,99 @@ def run_query(
         meta={"variants_enabled": enabled_variants},
     ) if opts.use_refiner else []
 
-    chosen_candidate: Dict[str, Any]
-    arbiter_meta: Dict[str, Any]
     if not refiners:
-        chosen_candidate = {"name": "FALLBACK", "query": q_curr, "constraints": {"must_include_terms": must_terms, "avoid_terms": avoid_terms}}
-        arbiter_meta = {"winner": "FALLBACK", "reason": "no_refine_candidates", "considered": []}
-        _dbg("ARBITER_DECISION", arbiter_meta)
-    elif opts.use_arbiter and len(refiners) > 1:
+        refiners = [{"name": "A1", "query": q_curr, "constraints": {"must_include_terms": must_terms, "avoid_terms": avoid_terms}}]
+        enabled_variants = ["A1"]
+        _dbg("REFINE_FALLBACK", {"trace_id": trace_id, "reason": "no_candidates_from_refine"})
+
+    retrieval_by_variant: Dict[str, Dict[str, Any]] = {}
+    if opts.use_retrieve:
+        def _run_variant_retrieve(candidate: Dict[str, Any]) -> Dict[str, Any]:
+            return _retrieve_candidate_package(
+                candidate=candidate,
+                manifest=manifest,
+                manifest_path=mp,
+                selected_categories=selected_categories,
+                top_k=opts.top_k,
+                max_workers=max_workers,
+                max_context_chars=opts.max_context_chars,
+                debug=debug,
+            )
+
+        variant_packages = _stage(
+            "retrieve",
+            lambda: [_run_variant_retrieve(c) for c in refiners],
+            meta={"variants": [str(c.get("name") or "A1") for c in refiners]},
+        )
+        retrieval_by_variant = {str(p.get("candidate") or "A1"): p for p in variant_packages}
+    else:
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "retrieve"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "retrieve", "elapsed_ms": 0.0, "next_stage": "write", "reason": "disabled"})
+
+    chosen_candidate: Dict[str, Any] = refiners[0]
+    chosen_hits: List[Dict[str, Any]] = retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits", []) if retrieval_by_variant else []
+    arbiter_meta: Dict[str, Any] = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "not_run", "considered": [str(x.get("name") or "A1") for x in refiners]}
+
+    if opts.use_retrieve and opts.use_arbiter and len(retrieval_by_variant) > 1:
+        candidates_for_arbiter = []
+        for candidate in refiners:
+            name = str(candidate.get("name") or "A1")
+            pkg = retrieval_by_variant.get(name, {})
+            candidates_for_arbiter.append({
+                "candidate": name,
+                "query_used": str(candidate.get("query") or q_curr),
+                "constraints": dict(candidate.get("constraints") or {}),
+                "hits": list(pkg.get("hits") or []),
+                "hits_count": int(pkg.get("hits_count") or 0),
+            })
+
         arbiter_out = _stage(
             "arbiter",
             lambda: arbitrate(
                 q_curr,
-                refiners,
+                candidates_for_arbiter,
                 [],
                 categories=selected_categories,
                 selector_instruction=str((confirm_out.get("raw") or {}).get("selector_instruction") or ""),
                 debug=debug,
             ),
         )
-        chosen_candidate = {
-            "name": arbiter_out.get("chosen_variant_name") or "A1",
-            "query": arbiter_out.get("chosen_query") or q_curr,
-            "constraints": arbiter_out.get("chosen_constraints") or {},
-        }
+        winner = str(arbiter_out.get("winner") or arbiter_out.get("chosen_variant_name") or "A1").upper()
+        chosen_candidate = next((c for c in refiners if str(c.get("name") or "").upper() == winner), refiners[0])
+        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
         arbiter_meta = {
-            "winner": chosen_candidate.get("name"),
-            "reason": arbiter_out.get("rationale", ""),
-            "considered": arbiter_out.get("considered", []),
+            "winner": str(chosen_candidate.get("name") or "A1"),
+            "reason": str(arbiter_out.get("why") or arbiter_out.get("rationale") or "selected_by_arbiter"),
+            "considered": list(arbiter_out.get("considered") or [str(x.get("name") or "A1") for x in refiners]),
+            "signal_summary": dict(arbiter_out.get("signal_summary") or {}),
+            "selected_indexes": list(arbiter_out.get("selected_indexes") or []),
+            "also_indexes": list(arbiter_out.get("also_indexes") or []),
         }
-        _dbg("ARBITER_DECISION", arbiter_meta)
-    else:
+        _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
+    elif not opts.use_retrieve:
         if opts.use_arbiter:
-            _dbg("STAGE_BEGIN", {"stage_name": "arbiter"})
-            _dbg("STAGE_END", {"stage_name": "arbiter", "elapsed_ms": 0.0, "next_stage": "retrieve", "reason": "single_candidate"})
-        chosen_candidate = refiners[0]
-        arbiter_meta = {
-            "winner": chosen_candidate.get("name", "A1"),
-            "reason": "arbiter_disabled_or_single_candidate",
-            "considered": [r.get("name") for r in refiners],
-        }
-        _dbg("ARBITER_DECISION", arbiter_meta)
+            _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "retrieve_disabled"})
+        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "retrieve_disabled", "considered": [str(x.get("name") or "A1") for x in refiners]}
+    elif not opts.use_arbiter:
+        default_name = "A1" if any(str(x.get("name") or "").upper() == "A1" for x in refiners) else str(refiners[0].get("name") or "A1")
+        chosen_candidate = next((c for c in refiners if str(c.get("name") or "").upper() == default_name), refiners[0])
+        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
+        _dbg("ARBITER_SKIPPED", {"trace_id": trace_id, "reason": "disabled", "default": default_name})
+        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "disabled", "considered": [str(x.get("name") or "A1") for x in refiners]}
+    else:
+        chosen_hits = list(retrieval_by_variant.get(str(chosen_candidate.get("name") or "A1"), {}).get("hits") or [])
+        arbiter_meta = {"winner": str(chosen_candidate.get("name") or "A1"), "reason": "single_candidate", "considered": [str(x.get("name") or "A1") for x in refiners]}
+        _dbg("ARBITER_DECISION", dict({"trace_id": trace_id}, **arbiter_meta))
 
     q_final = str(chosen_candidate.get("query") or q_curr)
+    refs = _collect_references(manifest, chosen_hits)
 
-    category_infos = []
-    for cname in selected_categories:
-        cat = manifest.categories.get(cname)
-        category_infos.append({"category": cname, "vector_store_id": str(getattr(cat, "vector_store_id", "") or "")})
-
-    hits: List[Dict[str, Any]] = []
-    if opts.use_retrieve:
-        hits = _stage(
-            "retrieve",
-            lambda: _retrieve_by_category(
-                q_final=q_final,
-                refiners=[chosen_candidate],
-                category_infos=category_infos,
-                max_workers=max_workers,
-                retrieve_timeout_s=_env_float("WEBAPP_RETRIEVE_TIMEOUT_S", 30),
-                top_k=opts.top_k,
-                debug=debug,
-                unbounded=True,
-            ),
-            meta={"query_used": q_final},
-        )
-        hits = attach_local_paths(manifest, merge_and_dedupe_evidence(hits or []), library_root=Path(mp).parent)
-        hits = _shrink_evidence_payload((hits or []), max_hits=5, max_per_hit_chars=1200)
-        hits = _cap_evidence_chars(hits, opts.max_context_chars)
-    else:
-        _dbg("STAGE_BEGIN", {"stage_name": "retrieve"})
-        _dbg("STAGE_END", {"stage_name": "retrieve", "elapsed_ms": 0.0, "next_stage": "write", "reason": "disabled"})
-
-    refs = _collect_references(manifest, hits)
     if opts.use_write:
-        answer = _stage("write", lambda: write_stage.run(q_final, hits, debug=debug))
+        answer = _stage("write", lambda: write_stage.run(q_final, chosen_hits, debug=debug))
         status = "ok"
     else:
-        _dbg("STAGE_BEGIN", {"stage_name": "write"})
-        _dbg("STAGE_END", {"stage_name": "write", "elapsed_ms": 0.0, "next_stage": "done", "reason": "disabled"})
+        _dbg("STAGE_BEGIN", {"trace_id": trace_id, "stage_name": "write"})
+        _dbg("STAGE_END", {"trace_id": trace_id, "stage_name": "write", "elapsed_ms": 0.0, "next_stage": "done", "reason": "disabled"})
         status = "ok"
         answer = "Etapa write deshabilitada por configuración de pipeline."
 
@@ -926,7 +1010,17 @@ def run_query(
         "selected_categories": selected_categories,
         "confirm": confirm_out,
         "chosen_candidate": chosen_candidate,
+        "chosen_candidate_hits_count": len(chosen_hits),
         "arbiter": arbiter_meta,
+        "variants_enabled": enabled_variants,
+        "retrieval_by_variant": {
+            name: {
+                "hits_count": int(pkg.get("hits_count") or 0),
+                "elapsed_ms": pkg.get("elapsed_ms"),
+                "query_used": pkg.get("query_used"),
+            }
+            for name, pkg in retrieval_by_variant.items()
+        },
         "warnings": [] if opts.use_retrieve else ["retrieve_disabled"],
         "degrade_steps": [] if opts.use_write else ["write_disabled"],
     }
