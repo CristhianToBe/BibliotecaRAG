@@ -61,7 +61,15 @@ def run(
         print(f"[debug] version_root={vroot}")
         print(f"[debug] apply={apply} mode={mode} docs={len(docs)}")
 
-    doc_prefix = stage_infer_prefixes(client, model_nano, docs, prefix_batch, prompts["prefix"])
+    doc_prefix = stage_infer_prefixes(
+        client,
+        model_nano,
+        docs,
+        prefix_batch,
+        prompts["prefix"],
+        prompts["prefix_normalize"],
+        debug=debug,
+    )
 
     _, base_paths = stage_build_taxonomy(client, model_tax, manifest, version_label, vroot, taxonomy_system=prompts["taxonomy"])
     stage_write_prefixed_taxonomy_view(vroot, doc_prefix, base_paths)
