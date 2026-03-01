@@ -14,7 +14,6 @@ from .utils import norm_author_key, slugify
 def get_prompts() -> Dict[str, str]:
     return {
         "prefix": load_prompt("library_ops_prefix_system"),
-        "prefix_normalize": load_prompt("library_ops_prefix_normalize_system"),
         "taxonomy": load_prompt("library_ops_taxonomy_system"),
         "propose": load_prompt("library_ops_propose_system"),
         "validate": load_prompt("library_ops_validate_system"),
@@ -29,7 +28,7 @@ def infer_prefixes_batch(client, model_nano: str, docs: List[Doc], *, prefix_sys
         did = r.get("doc_id")
         if not did:
             continue
-        ak = str(r.get("author_key") or "DESCONOCIDO")
+        ak = norm_author_key(r.get("author_key"))
         y = r.get("year", None)
         try:
             y = int(y) if y is not None else None
@@ -76,16 +75,3 @@ def propose_base_path(client, model_nano: str, taxonomy_paths: List[str], doc: D
 def validate_batch(client, model_mini: str, taxonomy_paths: List[str], batch_items: List[Dict[str, Any]], *, validate_system: str) -> Dict[str, Any]:
     payload = {"taxonomy_paths": taxonomy_paths[:2000], "batch": batch_items}
     return llm_json(client=client, model=model_mini, system=validate_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def normalize_prefixes_batch(client, model_nano: str, raw_author_keys: List[str], *, normalize_system: str) -> Dict[str, str]:
-    payload = {"author_keys": list(raw_author_keys)}
-    out = llm_json(client=client, model=model_nano, system=normalize_system, user=json.dumps(payload, ensure_ascii=False, indent=2))
-    mapping = out.get("mapping") or {}
-    if not isinstance(mapping, dict):
-        mapping = {}
-    fixed: Dict[str, str] = {}
-    for raw in raw_author_keys:
-        cand = mapping.get(raw)
-        fixed[raw] = norm_author_key(str(cand) if cand is not None else "DESCONOCIDO")
-    return fixed
